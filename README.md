@@ -51,10 +51,10 @@ The results are shown in the below figure.
 
 ![](daily_ml_temperature_budget_Atlantic_May_to_Aug_2023_allterms.png)
 
-Comparing this figure to the above monthly-averaged figure, you can see some differences but they don't appear to be first-order. The mixed layer temperature tendency term is identical (because it's computed from snapshots at the beginning and ending of the entire time period), while the terms in the budget do change somewhat. 
+Comparing this figure to the above monthly-averaged figure, you can see some differences but they don't appear to be first-order. The mixed layer temperature tendency term is identical (because it's computed from snapshots at the beginning and ending of the entire time period), while the terms in the budget do change somewhat. Whether these differences are important depends on your application and appetite for errors. 
 
-This could and should be quantified more precisely.
+The size of these errors for the specific application should be quantified more precisely (another one I'll leave to the reader). 
 
-Just for reference, here is a time series over the daily budget terms averaged between 80-20$^\circ$W, $10-40^\circ$N:
+Just for reference, here is a time series over the daily budget terms averaged between 80-20$^\circ$W, $10-40^\circ$N. Clearly, the net surface heat flux is a main driver of the warming (not surprising, given this is northern hemisphere summer).
 
 ![](daily_ml_temperature_budget_Atlantic_mainterms_time_series.png)
