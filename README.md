@@ -6,10 +6,10 @@ See the notebook `Mixed_Layer_Heat_Budget_ACCESS-OM2.ipynb` for the theory, disc
 
 ## Required diagnostics and results for North Atlantic MHW, summer 2023
 
-The following figure shows all the terms in the mixed layer temperature budget averaged over the months of May-July 2023 in the North Atlantic, using monthly-averaged diagnostics.
+The following figure shows all the terms in the mixed layer temperature budget averaged over the months of May-Aug 2023 in the North Atlantic, using monthly-averaged diagnostics.
 Units are $^\circ$C/month.
 
-![](monthly_ml_temperature_budget_Atlantic_May_to_Jul_2023_allterms.png)
+![](monthly_ml_temperature_budget_Atlantic_May_to_Aug_2023_allterms.png)
 
 In this figure:
 - `mlt_tendency` is the mixed layer temperature tendency, computed from *snapshots* of the temperature, grid cell thickness (`dzt`) and potential density `pot_rho_0` at the beginning and ending of each month. The mixed layer temperature is computed from these diagnostics using a $0.125$kgm$^{-3}$ density criterion, and using the exact time-varying grid cell thicknesses `dzt`.
@@ -20,7 +20,7 @@ In this figure:
 
 Clearly most terms are pretty small (although this may not neccessarily be true for anomalies from a climatology). The following is a simpler figure with terms grouped and the main terms shown:
 
-![](monthly_ml_temperature_budget_Atlantic_May_to_Jul_2023_mainterms.png)
+![](monthly_ml_temperature_budget_Atlantic_May_to_Aug_2023_mainterms.png)
 
 These figures has required the following diagnostics:
 1. Full 3D monthly-averaged heat budget diagnostics (`temp_tendency=temp_advection+...`).
@@ -49,6 +49,12 @@ The above budget is not fully accurate since it neglects correlations between su
 To check whether this introduces a significant error, the notebook contains a similar computation but using daily averaged diagnostics.
 The results are shown in the below figure.
 
-![](daily_ml_temperature_budget_Atlantic_May_to_Jul_2023_allterms.png)
+![](daily_ml_temperature_budget_Atlantic_May_to_Aug_2023_allterms.png)
 
-XXX TODO
+Comparing this figure to the above monthly-averaged figure, you can see some differences but they don't appear to be first-order. The mixed layer temperature tendency term is identical (because it's computed from snapshots at the beginning and ending of the entire time period), while the terms in the budget do change somewhat. 
+
+This could and should be quantified more precisely.
+
+Just for reference, here is a time series over the daily budget terms averaged between 80-20$^\circ$W, $10-40^\circ$N:
+
+![](daily_ml_temperature_budget_Atlantic_mainterms_time_series.png)
