@@ -27,7 +27,6 @@ These figures has required the following diagnostics:
 2. Monthly-averaged `dzt` and `pot_rho_0` to average the heat budget diagnostics over the mixed layer depth.
 3. Snapshots of `temp`, `dzt` and `pot_rho_0` at the beginning and ending of each month to compute the `mlt_tendency` term, and thus the `entrainment` term by residual from `temp_tendency`.
 
-
 ## When snapshots are not available
 
 Unfortunately, the snapshots (number 3 above) required to compute the `mlt_tendency` (and thus `entrainment`) are not available from the full `omip2_cycle6` cycle. However, if one is only interested in a climatology of `mlt_tendency` (so that one can compute anomalies for 2023, where diagnostics are available), I think it should still be possible to compute this using interpolated derivatives of the *time-averaged* mixed layer temperature, since this will be pretty smooth anyway. 
@@ -42,11 +41,14 @@ You should now have a climatological average of `mlt_tendency`, defined appropri
 
 Note: the action of taking time derivatives and then time averages in steps 2 and 3 above will mean you lose months at either end of the time period. As long as your climatology period is shorter than the total simulation length this shouldn't be a problem.
 
+I'll leave doing this one to the reader :).
+
 ## Comparing monthly vs. daily-averaged diagnostics
 
 The above budget is not fully accurate since it neglects correlations between submonthly variations in the heat budget diagnostics (`temp_tendency` etc.) and the mixed layer depth.
 To check whether this introduces a significant error, the notebook contains a similar computation but using daily averaged diagnostics.
 The results are shown in the below figure.
 
-XXX to do
+![](daily_ml_temperature_budget_Atlantic_May_to_Jul_2023_allterms.png)
 
+XXX TODO
