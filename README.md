@@ -22,12 +22,20 @@ Clearly most terms are pretty small (although this may not neccessarily be true 
 
 ![](monthly_ml_temperature_budget_Atlantic_May_to_Aug_2023_mainterms.png)
 
-These figures has required the following diagnostics:
+
+## Time series
+
+Just for reference, here is a time series over the daily budget terms averaged between 80-20$^\circ$W, $10-40^\circ$N. Clearly, the net surface heat flux is a main driver of the warming (not surprising, given this is northern hemisphere summer).
+
+![](daily_ml_temperature_budget_Atlantic_mainterms_time_series.png)
+
+## When snapshots are not available
+
+The figures above have required the following diagnostics:
 1. Full 3D monthly-averaged heat budget diagnostics (`temp_tendency=temp_advection+...`).
 2. Monthly-averaged `dzt` and `pot_rho_0` to average the heat budget diagnostics over the mixed layer depth.
 3. Snapshots of `temp`, `dzt` and `pot_rho_0` at the beginning and ending of each month to compute the `mlt_tendency` term, and thus the `entrainment` term by residual from `temp_tendency`.
 
-## When snapshots are not available
 
 Unfortunately, the snapshots (number 3 above) required to compute the `mlt_tendency` (and thus `entrainment`) are not available from the full `omip2_cycle6` cycle. However, if one is only interested in a climatology of `mlt_tendency` (so that one can compute anomalies for 2023, where diagnostics are available), I think it should still be possible to compute this using interpolated derivatives of the *time-averaged* mixed layer temperature, since this will be pretty smooth anyway. 
 
@@ -53,8 +61,9 @@ The results are shown in the below figure.
 
 Comparing this figure to the above monthly-averaged figure, you can see some differences but they don't appear to be first-order. The mixed layer temperature tendency term is identical (because it's computed from snapshots at the beginning and ending of the entire time period), while the terms in the budget do change somewhat. Whether these differences are important depends on your application and appetite for errors. 
 
-The size of these errors for the specific application should be quantified more precisely (another one I'll leave to the reader). 
+For an area average between 40-80W, 10-40N, comparing monthly averages of the daily-derived data (dashed lines below) to the monthly-derived data (solid lines below) shows the error:
 
-Just for reference, here is a time series over the daily budget terms averaged between 80-20$^\circ$W, $10-40^\circ$N. Clearly, the net surface heat flux is a main driver of the warming (not surprising, given this is northern hemisphere summer).
+![](Daily_Monthly_area_averaged_comparison.png)
 
-![](daily_ml_temperature_budget_Atlantic_mainterms_time_series.png)
+The size of these errors for the specific application should be quantified more precisely, as whether they are important depends on the application.
+
