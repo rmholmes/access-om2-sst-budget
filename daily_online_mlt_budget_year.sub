@@ -6,7 +6,7 @@
 #PBS -l walltime=01:00:00
 #PBS -l jobfs=10GB
 #PBS -l wd
-#PBS -l storage=gdata/xp65+gdata/e14
+#PBS -l storage=gdata/xp65+gdata/e14+scratch/e14
 #PBS -q normal
 
 module purge
@@ -28,8 +28,8 @@ client = Client(n_workers=28)
 # Settings and paths:
 output = XXOUTPUTXX
 
-base = '/g/data/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/'
-tmp_folder = '/g/data/e14/rmh561/mlt_budget_temporary/'
+base = '/scratch/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/'
+tmp_folder = base + 'post_processed_diags/'
 
 base2 = base + 'output%03d/ocean/' % output
 reg = [None,None,None,None] # Globe
@@ -45,12 +45,6 @@ Cp = 3992.10322329649
 # Standard average daily budget diagnostics:
 ds_day_budget = xr.open_dataset(base2 + 'ocean_budget_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
 
-# Falling average daily budget daignostics (while the name of the averaging is "risavg", in effect this is actually the falling average diagnostics):
-ds_day_budget_falavg = xr.open_dataset(base2 + 'ocean_budget_daily_risavg.nc',decode_times=False).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
-
-# Standard daily diagnostics:
-ds_day = xr.open_dataset(base2 + 'ocean_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
-
 # Snapshots for standard average tendency computation:
 ds_day_snapshot = xr.open_dataset(base2 + 'ocean_snapshot_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
 # Add previous output for last element:
@@ -59,23 +53,18 @@ ds_day_snapshot = xr.concat([ds_day_snapshot_m1.isel(time=-1),ds_day_snapshot],d
 
 # Fix time variable by decoding time by hand (see https://forum.access-hive.org.au/t/cftime-vs-datetime64-time-encoding-issues-with-access-om2-025-omip-2-run/4085);
 ds_day_budget = ds_day_budget.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_budget.time.values]})
-ds_day_budget_falavg = ds_day_budget_falavg.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_budget_falavg.time.values]})
-ds_day = ds_day.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day.time.values]})
 ds_day_snapshot = ds_day_snapshot.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_snapshot.time.values]})
 
 # Fix average_DT by decoding by hand:
 ds_day_budget.average_DT.data = ds_day_budget.average_DT*np.timedelta64(1,'D')
-ds_day_budget_falavg.average_DT.data = ds_day_budget_falavg.average_DT*np.timedelta64(1,'D')
-ds_day.average_DT.data = ds_day.average_DT*np.timedelta64(1,'D')
 
 # Subselect time period:
 ds_day_budget = ds_day_budget.sel(time=times)
-ds_day_budget_falavg = ds_day_budget_falavg.sel(time=times)
-ds_day = ds_day.sel(time=times)
 ds_day_snapshot = ds_day_snapshot.sel(time=times_snap)
 
 
-bud_var_grps = {'advection':['temp_advection_in_mld',
+bud_tendency = 'temp_tendency_in_mld_cor'
+bud_var_grps = {'advection':['temp_advection_in_mld_cor',
                              'temp_submeso_in_mld',
                              'neutral_diffusion_in_mld_temp',
                              'neutral_gm_in_mld_temp',
@@ -85,21 +74,38 @@ bud_var_grps = {'advection':['temp_advection_in_mld',
                 'surface_flux':['temp_rivermix_in_mld',
                                 'temp_vdiffuse_sbc_in_mld', 
                                 'frazil_3d_in_mld',
-                                'sfc_hflux_pme_in_mld',
-                                'temp_eta_smooth_in_mld'], 
+                                'sfc_hflux_pme_in_mld_cor',
+                                'temp_eta_smooth_in_mld_cor'], 
                 'sw_pen':['sw_heat_in_mld']}
 bud_var_extras = {'shortwave':['swflx_in_mld'],
                   'longwave':['lw_heat_in_mld'],
                   'sensible':['sens_heat_in_mld'],
                   'latent':['evap_heat_in_mld']}
 
+def compute_corrections(ds_day_budget):
+
+    # P-E+R correction: 
+    pme_cor = -ds_day_budget['pme_river_times_temp_in_mld']/rho0
+    ds_day_budget['sfc_hflux_pme_in_mld_cor'] = ds_day_budget['sfc_hflux_pme_in_mld'] + pme_cor*rho0*Cp
+
+    # Eta-smoother correction:
+    eta_smoother_cor = -ds_day_budget['eta_smoother_times_temp_in_mld']/rho0
+    ds_day_budget['temp_eta_smooth_in_mld_cor'] = ds_day_budget['temp_eta_smooth_in_mld'] + eta_smoother_cor*rho0*Cp
+
+    # Advection correction:
+    adv_cor1 = (-ds_day_budget['eta_t_tendency_times_temp_in_mld'] + ds_day_budget['pme_river_times_temp_in_mld'] + ds_day_budget['eta_smoother_times_temp_in_mld'])/rho0
+    adv_cor2 = ds_day_budget['s_surf_ent_temp']/rho0
+    ds_day_budget['temp_advection_in_mld_cor'] = ds_day_budget['temp_advection_in_mld'] + adv_cor1*rho0*Cp  + adv_cor2*rho0*Cp
+
+    # Total correction for entrainment-by-residual:
+    ds_day_budget['temp_tendency_in_mld_cor'] = ds_day_budget['temp_tendency_in_mld']  + pme_cor*rho0*Cp + adv_cor1*rho0*Cp + adv_cor2*rho0*Cp + eta_smoother_cor*rho0*Cp
+
+    return(ds_day_budget)
+
 def mlt_budget_fixedh(ds_day_budget, do_extras = True):
-    """
-    Compute fixedh budget terms, including residual. Does not include entrainment or mlt tendency.
-    if do_extras=True, also add extra budget terms (e.g. the components of the surface flux) from bud_var_extras.
-    """
+
     # Extract variable sums in groups, dividing by rho0*Cp to convert to degC/second
-    mlt_budget = (ds_day_budget['temp_tendency_in_mld']/rho0/Cp).rename('fixedh_tendency').to_dataset()
+    mlt_budget = (ds_day_budget[bud_tendency]/rho0/Cp).rename('fixedh_tendency').to_dataset()
     for var in bud_var_grps.keys():
         mlt_budget[var] = ds_day_budget[bud_var_grps[var][0]]/rho0/Cp
         if (len(bud_var_grps[var])>1):
@@ -121,16 +127,12 @@ def mlt_budget_fixedh(ds_day_budget, do_extras = True):
     return(mlt_budget)
 
 def compute_tendency_entrainment(mlt_budget,mlt_snap):
-    """
-    Compute tendency term from snapshots and entrainment by residual.
-    """
 
     mlt_snap = mlt_snap.transpose(*mlt_budget['fixedh_tendency'].dims)
 
     # Compute mlt tendency by taking time derivative of snapshot mlt:
     mlt_budget['mlt_tendency'] = xr.zeros_like(mlt_budget.fixedh_tendency).copy(deep=True)
     mlt_budget['mlt_tendency'].data = mlt_snap.isel(time=slice(1,None)).values - mlt_snap.isel(time=slice(0,-1)).values
-    # mlt_budget['mlt_tendency'] = mlt_budget['mlt_tendency']/(ds_day_budget.average_DT/np.timedelta64(1,'s')) # Note: Depending on time decoding this line may change
     DT = xr.zeros_like(mlt_budget['mlt_tendency'].time)
     DT.data = (mlt_snap.time.isel(time=slice(1,None)).values-mlt_snap.time.isel(time=slice(0,-1)).values)/np.timedelta64(1,'s')
     mlt_budget['mlt_tendency'] = mlt_budget['mlt_tendency']/DT
@@ -139,6 +141,8 @@ def compute_tendency_entrainment(mlt_budget,mlt_snap):
     mlt_budget['entrainment'] = -(mlt_budget['fixedh_tendency'] - mlt_budget['mlt_tendency'])
 
     return(mlt_budget)
+
+ds_day_budget = compute_corrections(ds_day_budget)
 
 # Compute in blocks (e.g. if doing a whole year):
 

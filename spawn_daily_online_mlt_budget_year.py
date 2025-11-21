@@ -5,9 +5,10 @@ import os
 import fileinput
 import time as time_sleeper
 
-outputs = np.arange(337,338)
+outputs = np.arange(336,366) # 336 = 1989, 365=2018
+#outputs = [364,365,366]
 sleep_time = 0
-dry = False
+dry = True
 
 # Submit a job for each year:
 os.chdir('tmp_qsub_scripts/')
