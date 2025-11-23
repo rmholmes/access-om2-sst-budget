@@ -1,69 +1,183 @@
-# Mixed layer heat budget analysis of ACCESS-OM2 runs
+# Accurately diagnosing mixed layer tracer budgets in ACCESS-OM2/MOM5
 
-This notebook contains a quick analysis of the mixed layer heat budget in ACCESS-OM2, using online heat budget diagnostics, including the computation of the entrainment term.
+This repository contains methodology and analysis routines for accurately diagnosing mixed layer tracer budgets in the ACCESS-OM2 global numerical ocean model. The methods make use of new online diagnostics added to the MOM5 source code for this purpose, as described in the following paper,
 
-See the notebook `Mixed_Layer_Heat_Budget_ACCESS-OM2.ipynb` for the theory, discussion, explanation and code.
+Holmes, Malan and Bladwell, Accurately diagnosing mixed layer tracer budgets in a global ocean model, in preparation.
 
-## Required diagnostics and results for North Atlantic MHW, summer 2023
+## Repository contents
 
-The following figure shows all the terms in the mixed layer temperature budget averaged over the months of May-Aug 2023 in the North Atlantic, using monthly-averaged diagnostics.
-Units are $^\circ$C/month.
+This README contains a short overview of the theory and diagnostics. See the above paper for more details on the theory.
 
-![](monthly_ml_temperature_budget_Atlantic_May_to_Aug_2023_allterms.png)
+Jupyter notebooks:
+- `Mixed_Layer_Temperature_Budget.ipynb` - contains code to load in pre-computed budget diagnostics and analyse an event/time period of interest (start here if you are new).
+- `Offline_Online_Budget_Comparison.ipynb` - contains code to compare online with offline methods.
+- `Testing_and_Checks.ipynb` - contains code to perform a range of checks used during development of the methods (e.g. budget closure checks, diagnostic checks etc.).
+- `Process_Online_Budget.ipynb` - contains code to pre-compute grouped budget terms (for use in Mixed_Layer_Temperature_Budget.ipynb) from raw mixed-layer-binned MOM5 diagnostics. Note that this code is only for testing, use the script `spawn_process_online_budget.py` for production runs.
+- `Mixed_Layer_Temperature_Budget_offline.ipynb` - old code used to compute offline budgets before the online diagnostics were available.
+- `Mixed_Layer_Salinity_Budget.ipynb` - as for `Mixed_Layer_Temperature_Budget.ipynb` but for salinity (minimal work done on this so far, beyond checking that it works).
 
-In this figure:
-- `mlt_tendency` is the mixed layer temperature tendency, computed from *snapshots* of the temperature, grid cell thickness (`dzt`) and potential density `pot_rho_0` at the beginning and ending of each month. The mixed layer temperature is computed from these diagnostics using a $0.125$kgm$^{-3}$ density criterion, and using the exact time-varying grid cell thicknesses `dzt`.
-- `temp_tendency` is the "fixed-depth" temperature tendency term `temp_tendency` (see the notebook for an explanation), the LHS of the models heat budget equation converted to a temperature tendency by dividing by $\rho_0$, $C_p$ and the time-averaged mixed layer depth computed with time-averaged `dzt` and `pot_rho_0`.
-- `entrainment` is the entrainment term, computed by residual between `mlt_tendency` and `temp_tendency`.
-- The remaining terms are all the processes on the RHS of the heat budget equation. E.g. `temp_advection` is 3D advection, `temp_vdiffuse_diff_cbt` and `temp_nonlocal_KPP` are the vertical mixing terms, `temp_vdiffuse_sbc` is the total surface heat flux, `sw_heat` is the amount of SW radiation that penetrates below the mixed layer.
-- `residual` is the residual (zero, see the `_tighter_clims.png` version of the figure).
+Other scripts:
+- `spawn_process_online_budget.py` and `process_online_budget_year.sub` - scripts for computing the grouped mixed layer tracer budgets a year at a time using parallel PBS jobs on NCI.
 
-Clearly most terms are pretty small (although this may not neccessarily be true for anomalies from a climatology). The following is a simpler figure with terms grouped and the main terms shown:
+## Background Theory and diagnostics
 
-![](monthly_ml_temperature_budget_Atlantic_May_to_Aug_2023_mainterms.png)
+### ACCESS-OM2 "Eulerian" heat budget
 
+The budget for temperature within a single grid-cell of a finite-volume global ocean model can be formulated as:
 
-## Time series
+\begin{equation}
+    \frac{\partial}{\partial t}\left(\int_R \rho_0 C dV\right) = -\oint_{\partial R} \left[\rho_0 C (\mathbf{v} - \mathbf{v}^{(b)}) + \mathbf{J}\right]\cdot\mathbf{\hat{n}}\,d\mathcal{S},
+\end{equation}
 
-Just for reference, here is a time series over the daily budget terms averaged between 80-20$^\circ$W, $10-40^\circ$N. Clearly, the net surface heat flux is a main driver of the warming (not surprising, given this is northern hemisphere summer).
+where $R$ represents the grid cell region, $C$ is the tracer concentration $=C_p \Theta$ for temperature, $\mathbf{\hat{n}}$ is the outward normal vector on the boundary surface $\partial R$, $d\mathcal{S}$ is the area element on that boundary, $\mathbf{v}$ is the fluid velocity, $\mathbf{v}^{(b)}$ is the velocity of the boundary and $\mathbf{J}$ represents tracer fluxes across the boundary surface associated with sub-grid scale parameterizations (such as vertical mixing) and boundary fluxes (such as air-sea tracer fluxes).
 
-![](daily_ml_temperature_budget_Atlantic_mainterms_time_series.png)
+The equivalent equation in terms of MOM5 diagnostics (per unit area) is given by:
+\begin{align}
+  \textit{temp\_tendency} = &\textit{temp\_advection} + \\ &\quad +
+  \textit{temp\_submeso} \\ &\quad + \textit{temp\_vdiffuse\_diff\_cbt}  + \textit{temp\_nonlocal\_KPP} \\ &\quad + \textit{sw\_heat} +
+  \textit{temp\_rivermix} + \textit{temp\_vdiffuse\_sbc} + \textit{sfc\_hflux\_pme} \\
+  & \quad + \textit{frazil\_3d}\\ 
+   & \quad + \textit{temp\_vdiffuse\_k33} + \textit{neutral\_diffusion\_temp}\\
+   & \quad + \textit{neutral\_gm\_temp} \\
+   & \quad + \textit{mixdownslope\_temp} + \textit{temp\_sigma\_diff} + \textit{temp\_eta\_smooth}
+\end{align}
 
-## When snapshots are not available
+All terms are in units of Wm$^{-2}$ - i.e. the tendency of the heat content within each grid cell per unit area, $\rho_0 C_p\Theta \Delta z$, where $\Delta z$ is the time variable grid cell thickness, $\rho_0=1035$kgm$^{-3}$ is the reference density, $C_p=3992.10322329649$Jkg$^{-1}$$^\circ$C$^{-1}$ is the specific heat and $\Theta$ is Conservative Temperature.
 
-The figures above have required the following diagnostics:
-1. Full 3D monthly-averaged heat budget diagnostics (`temp_tendency=temp_advection+...`).
-2. Monthly-averaged `dzt` and `pot_rho_0` to average the heat budget diagnostics over the mixed layer depth.
-3. Snapshots of `temp`, `dzt` and `pot_rho_0` at the beginning and ending of each month to compute the `mlt_tendency` term, and thus the `entrainment` term by residual from `temp_tendency`.
+- temp\_tendency is the tendency term
+- temp\_advection is the convergence of the three-dimensional resolved advection (this can be split into components by taking the convergence of the temp\_xflux\_adv, temp\_yflux\_adv and temp\_zflux\_adv terms). Note that this is equivalent to
+\begin{equation}
+-\oint_{\partial R - \partial\eta} \rho_0 C (\mathbf{v} - \mathbf{v}^{(b)})\cdot\mathbf{\hat{n}}\,d\mathcal{S},
+\end{equation}
+i.e. it does not include the dia-surface motion across the free-surface ($\partial\eta$), which is instead captured by $\textit{sfc\_hflux\_pme}$, equal to $-\oint_{\partial\eta} \rho_0 C (\mathbf{v} - \mathbf{v}^{(b)})\cdot\mathbf{\hat{n}}\,d\mathcal{S}$
+- temp\_submeso is the convergence of the three-dimensional parameterized submesoscale advection (pretty small).
+- temp\_vdiffuse\_diff\_cbt and temp\_nonlocal\_KPP are the vertical mixing terms.
+- The next line contains all of the surface heat flux terms. Note that sw\_heat is a three-dimensional term that *redistributes* the impact of SW radiation from the surface layer into the interior (i.e. it is negative in the surface layer and positive below, summing to zero). temp\_rivermix, a term that mixes vertically in regions of river runoff, is also three-dimensional as the impact of river runoff is spread over a few layers (4 I think). The other terms are two-dimensional (only non-zero in the surface layer).
+- frazil\_3d is the formation of frazil ice
+- temp\_vdiffuse\_k33 and neutral\_diffusion\_temp are parameterized along-isopycnal mixing (might not be on in all configurations, e.g. ACCESS-OM2-01).
+- neutral\_gm\_temp is parameterization advection by mesoscale eddies
+- The last line includes some miscellaneous mixing terms (all pretty small, and not all active depending on configuration).
 
+Also see https://github.com/COSIMA/access-om2/issues/139#issuecomment-639278547 for a discussion of the surface heat flux terms in ACCESS-OM2/CM2. See `Testing_and_Checks.ipynb` for a check of the closure of this budget.
 
-Unfortunately, the snapshots (number 3 above) required to compute the `mlt_tendency` (and thus `entrainment`) are not available from the full `omip2_cycle6` cycle. However, if one is only interested in a climatology of `mlt_tendency` (so that one can compute anomalies for 2023, where diagnostics are available), I think it should still be possible to compute this using interpolated derivatives of the *time-averaged* mixed layer temperature, since this will be pretty smooth anyway. 
+### Mixed layer temperature budget 
 
-Roughly, this would be done as follows:
-1. Compute mixed layer temperature from monthly averages using `temp`, `dzt` and `pot_rho_0` for each month in the full climatology period.
-2. Take the time derivative by a simple centered difference (these time derivatives will be centered at month transitions - e.g. around the Jan-Feb transition, Feb-Mar transition etc.).
-3. Interpolate these time derivatives back to the centre of the month using a simple average.
-4. Compute a climatology - i.e. average each month over the climatology period.
+The mixed layer depth is defined as the depth at which the buoyancy difference to the surface layer is $0.0003$ms$^{-2}$, corresponding to a density difference of $0.031$kgm$^{-3}$. 
+$0.03$kgm$^{-3}$ is a widely used value in the literature. We define the mixed layer in a continuous sense, such that the mixed layer base can lie between two grid cells (linear interpolation), with a known fractional contribution of the bottom grid cell to the mixed layer. The mixed layer within a given model column is defined by the region $\partial R_H$.
 
-You should now have a climatological average of `mlt_tendency`, defined appropriately at the centre of months. The climatology of `entrainment` can then be computed by taking the residual with the climatology of the mixed layer temperature `temp_tendency`. Finally, these climatologies can be subtracted from the absolute values for the months of interest (e.g. 2023) to yield an anomaly budget.
+We are most interested in the tracer concentration averaged over the mixed layer volume, rather than the total mixed layer tracer content.
+We define this (for temperature) as,
+\begin{equation}
+    \Theta_H \equiv \frac{1}{H}\int_{-H_z}^\eta \Theta dz,
+\end{equation}
+where $\eta$ is the free-surface height and $H_z$ is the depth of the mixed layer (from $z=0$), such that the total mixed layer depth is $H=\eta+H_z$.
 
-Note: the action of taking time derivatives and then time averages in steps 2 and 3 above will mean you lose months at either end of the time period. As long as your climatology period is shorter than the total simulation length this shouldn't be a problem.
+A bunch of maths, shown elsewhere (paper in preparation), shows that $\Theta_H$ obeys the budget equation,
 
-I'll leave doing this one to the reader :).
+\begin{align}
+        \frac{\partial \Theta_H}{\partial t}&= \quad\quad &\quad\quad\text{tendency}\\ &\quad-\frac{1}{AH}\oint_{\partial R_H - \partial\eta} \left(\Theta-\Theta_H\right) \mathbf{v}\cdot\mathbf{\hat{n}}\,d\mathcal{S}-\frac{Q_{\text{L}}}{\rho_0 H}\quad\quad &\quad\quad\text{advection (+ eddy processes)} \\
+        &\quad+\frac{Q_\text{net}}{\rho_0 H}-\frac{\Theta_a - \Theta_H}{\rho_0H}Q_m\quad\quad &\quad\quad\text{surface fluxes} \\
+        &\quad-\frac{Q_{\text{SWP}}}{\rho_0 H}\quad\quad &\quad\quad\text{shortwave penetration} \\
+        &\quad-\frac{Q_\text{mix}}{\rho_0 H}\quad\quad &\quad\quad\text{vertical mixing} \\
+        &\quad-\frac{\Theta_{\text{ent}}-\Theta_H}{H}\frac{\partial H_z}{\partial t}\quad\quad &\quad\quad\text{entrainment}
+\end{align}
+where $A$ is the area of the grid cell and other terms are described below, in order.
 
-## Comparing monthly vs. daily-averaged diagnostics
+#### Tendency (LHS): 
+The first line is the tendency term. Note that this term is not a diagnostic in MOM5 (it is not temp\_tendency, which is the tendency of the total heat content of the grid cells making up the mixed layer, $R_{\Sigma G}$ in the paper) and needs to be computed offline (from snapshots or time-averages, depending on whether standard or hat-averaging is used on the budget diagnostics) using a difference of mixed layer temperature diagnostics ($\textit{temp\_in\_mld}$, equal to $\Theta_H\rho_0$). This is done in the function `compute_tendency_entrainment` in the budget processing scripts.
 
-The above budget is not fully accurate since it neglects correlations between submonthly variations in the heat budget diagnostics (`temp_tendency` etc.) and the mixed layer depth.
-To check whether this introduces a significant error, the notebook contains a similar computation but using daily averaged diagnostics.
-The results are shown in the below figure.
+#### Advection/eddy processes: 
+The second line represents advection and eddy driven processes. This term is effectively equal to $\textit{temp\_advection} + \textit{temp\_submeso} + \textit{temp\_vdiffuse\_k33} + \textit{neutral\_diffusion\_temp} + \textit{neutral\_gm\_temp}$ divided by $C_p\rho_0 H$, except that since $H$ is time-varying, this division needs to be done at every time-step. This is done by the new diagnostics $\textit{temp\_advection\_in\_mld}$ (and equivalent for the eddy terms), which are equal to $\textit{temp\_advection}/H$ summed over the mixed layer (so divide these by $\rho_0 C_p$ to get the form used in the above equation). 
 
-![](daily_ml_temperature_budget_Atlantic_May_to_Aug_2023_allterms.png)
+However, we also note that more maths (see the appendix of the paper), shows that two additional correction terms,
+\begin{equation}
+\frac{\Theta_H}{H}\nabla\cdot\mathbf{U} + \frac{\Theta_{\text{ent}}}{H} w^{(s)}_H
+\end{equation}
+need to be added to $\textit{temp\_advection\_in\_mld}/\rho_0/C_p$ in order to get the advection term in the above equation. The corrections account for the fact that the advection diagnostic $\textit{temp\_advection}$ is computed in GVC coordinates, not Eulerian coordinates. $\nabla\cdot\mathbf{U}$ is the divergence of the vertically-integrated transport (throughout the whole ocean depth) and $w^{(s)}_H$ is the vertical velocity of the GVC coordinate at the base of the mixed layer. We compute these two terms separately. Note that both of these correction terms are dependent on the temperature scale (e.g. Kelvin vs. Celsius), and thus remove the dependence of the temperature scale in $\textit{temp\_advection\_in\_mld}$ (since the form of the advection term in the budget equation above depends only on temperature differences).
 
-Comparing this figure to the above monthly-averaged figure, you can see some differences but they don't appear to be first-order. The mixed layer temperature tendency term is identical (because it's computed from snapshots at the beginning and ending of the entire time period), while the terms in the budget do change somewhat. Whether these differences are important depends on your application and appetite for errors. 
+To compute the $\frac{\Theta_H}{H}\nabla\cdot\mathbf{U}$ term, we add three new diagnostics, $\textit{eta\_t\_tendency\_times\_temp\_in\_mld}$, $\textit{pme\_river\_times\_temp\_in\_mld}$ and $\textit{eta\_smoother\_times\_temp\_in\_mld}$, computing $\frac{\Theta_H}{H}\nabla\cdot\mathbf{U}$ by residual of the free-surface equation (see testing section below),
 
-For an area average between 40-80W, 10-40N, comparing monthly averages of the daily-derived data (dashed lines below) to the monthly-derived data (solid lines below) shows the error:
+\begin{equation}
+\frac{\partial \eta}{\partial t} = -\nabla\cdot\mathbf{U} + Q_m/\rho_0 + S_{\text{smoother}}
+\end{equation}
 
-![](Daily_Monthly_area_averaged_comparison.png)
+To compute the $w^{(s)}_H$ dependent term, we compute $\Theta_{\text{ent}}$ by linearly interpolating the temperature to the mixed layer base, which is an approximation (although note that we show later on that this term is quite small). $w^{(s)}_H$ is computed for the $z^*$ vertical coordinates used in MOM5 via,
 
-The size of these errors for the specific application should be quantified more precisely, as whether they are important depends on the application.
+\begin{equation}
+w_{H}^{(s)} = (1-\frac{H}{D+\eta})\frac{\partial \eta}{\partial t},
+\end{equation}
+where $D$ is the ocean depth. This term is contained within the new diagnostic $\textit{s\_surf\_ent\_temp}$. Note that for testing purposes we have also added new diagnostics $\textit{temp\_at\_mlb}$, which is $\Theta_{\text{ent}}$ and $\textit{eta\_t\_tendency\_times\_temp\_at\_mlb}$, which is equal to $\Theta_{\text{ent}}\frac{\partial\eta}{\partial t}/H$.
+
+In summary, the advection term is given by the following combination of terms:
+
+\begin{equation}
+\frac{1}{\rho_0 C_p} \left[\textit{temp\_advection\_in\_mld}\right] + \textit{adv\_cor1} + \textit{adv\_cor2} + \frac{1}{\rho_0 C_p} \left[\textit{temp\_submeso\_in\_mld} + \textit{neutral\_diffusion\_in\_mld\_temp} + \textit{neutral\_gm\_in\_mld\_temp} + \textit{temp\_vdiffuse\_k33\_in\_mld}\right]
+\end{equation}
+
+where the advection corrections are,
+
+\begin{align}
+      \textit{adv\_cor1} &= \frac{1}{\rho_0}\left[-\textit{eta\_t\_tendency\_times\_temp\_in\_mld} + \textit{pme\_river\_times\_temp\_in\_mld} + \textit{eta\_smoother\_times\_temp\_in\_mld}\right] \\
+      \textit{adv\_cor2} &= \frac{1}{\rho_0} \textit{s\_surf\_ent\_temp}
+\end{align}
+
+#### Surface fluxes: 
+The third line represents surface fluxes, including surface mass fluxes and ice-ocean processes (like frazil formation). The only surface flux process that it doesn't include is shortwave redistribution. The second part of this term in the above equation accounts for the impact of surface mass fluxes, $Q_m$ (in kgs$^{-1}$), where $C_a$ is the tracer concentration of the added (or removed) surface mass. For temperature in MOM5, $C_a$ is equal to the temperature of the top grid cell. The $C_a$ dependent part of this term is $\textit{sfc\_hflux\_pme\_in\_mld}$. However, the $\Theta_H$ dependent portion,
+\begin{equation}
+\Theta_H Q_m/(\rho_0 H),
+\end{equation} 
+is a correction that needs to be computed separately. Again, due to the fact that $Q_m$, $\Theta_H$ and $H$ all vary in time, this term needs to be computed online and is captured by the new diagnostic $\textit{pme\_river\_times\_temp\_in\_mld}$. 
+
+Note that for simplicity (and because its small) we include $\textit{temp\_eta\_smooth\_in\_mld}$ in this term as well. Furthermore, we note that because the free-surface smoothing term is also a mass-flux related term, it also needs a correction similar to that used above - ie. we subtract $\textit{eta\_smoother\_times\_temp\_in\_mld}$ from it. Thus, all the mass-flux related terms (advection, P-E+R and the SSH-smoother) all need these types of corrections.
+
+In summary, the surface flux term is given by the following:
+
+\begin{align}
+&\frac{1}{\rho_0 C_p} \left[\textit{temp\_rivermix\_in\_mld} + \textit{temp\_vdiffuse\_sbc\_in\_mld} + \textit{frazil\_3d\_in\_mld}\right] \\
+&+ \frac{1}{\rho_0 C_p}\textit{sfc\_hflux\_pme\_in\_mld} - \frac{1}{\rho_0} \textit{pme\_river\_times\_temp\_in\_mld} \\
+&+ \frac{1}{\rho_0 C_p}\textit{temp\_eta\_smooth\_in\_mld\_cor}  - \frac{1}{\rho_0} \textit{eta\_smoother\_times\_temp\_in\_mld} 
+\end{align}
+
+Note that the contributions of latent, sensible, shortwave and longwave surface fluxes can also be analysed separately through the terms $\textit{swflx\_in\_mld}$, $\textit{lw\_heat\_in\_mld}$, $\textit{sens\_heat\_in\_mld}$, $\textit{evap\_heat\_in\_mld}$ (all divided by $\rho_0 C_p$).
+
+#### Shortwave penetration: 
+The fourth line represents shortwave penetration, simply equal to $\textit{sw\_heat\_in\_mld}/\rho_0/C_p$.
+
+#### Vertical mixing: 
+The fifth line represents vertical mixing at the base of the mixed layer, equal to $(\textit{temp\_vdiffuse\_diff\_cbt\_in\_mld}  + \textit{temp\_nonlocal\_KPP\_in\_mld})/\rho_0/C_p$.
+
+#### Entrainment: 
+The last line represents entrainment, where $\Theta_\text{ent}$ is the temperature of the entrained water. Due to the fact that $\Theta_{\text{ent}}$ needs a interpolation step to be computed, we instead compute this entire term by residual of the budget above.
+
+Note that the term $\textit{temp\_tendency\_in\_mld}$ is the sum of all the \textit{\_in\_mld terms}, which represents (apart from the 3 correction terms discussed above) the tendency in the heat content of the layer ignoring the extra heat content entering through entrainment. Hence (again ignoring the 3 corrections noted above) entrainment effectively represents the difference between $\textit{temp\_tendency\_in\_mld}$ and $\partial \Theta_H/\partial t$.
+
+The bulk of the work in computing these grouped budget terms is captured by the functions `compute_corrections`, `mlt_budget_fixedh` and `compute_tendency_entrainment` (also see `bud_var_grps`) used in the budget processing scripts in this repository.
+
+## Hat averaging
+
+The following material comes from Bladwell et al. (2025, in prep.). Consider a variable $\xi(t)$ (e.g. mixed layer temperature at a single location), defined as a function of time. We will consider two ``epochs" defined by the time periods $t\in(t_1,t_1+\Delta t_1)$ and  $t\in(t_2,t_2+\Delta t_2)$. The standard average of the tendency of $\xi$ between $t_1$ and $t_2+\Delta t_2$ (i.e. over the entire period covered by standard tendency diagnostics), multiplied by the time gap between them, is given by:
+\begin{equation}
+(t_2+\Delta t_2 - t_1)\overline{\frac{\partial\xi}{\partial t}}^{t_1,t_2+\Delta t_2} \equiv \int_{t_1}^{t_2+\Delta t_2} \frac{\partial\xi}{\partial t} dt = \left[\xi(t_2+\Delta t_2) - \xi(t_1)\right]
+\end{equation}
+This corresponds to a difference in snapshots of $\xi$, and thus is not typically a quantity of interest.
+
+Instead, we define the "hat average" operator between the two epochs as,
+\begin{equation}
+\hat{\frac{\partial\xi}{\partial t}}^{t_1,t_1+\Delta t_1,t_2,t_2+\Delta t_2} \equiv \int_{t_1}^{t_1+\Delta t_1} \frac{t-t_1}{\Delta t_1}\frac{\partial\xi}{\partial t} dt + \int_{t_1+\Delta t_1}^{t_2} \frac{\partial\xi}{\partial t} dt + \int_{t_2}^{t_2+\Delta t_2} \frac{t_2+\Delta t_2 - t}{\Delta t_2}\frac{\partial\xi}{\partial t} dt = \overline{\xi}^{t_2,t_2+\Delta t_2} - \overline{\xi}^{t_1,t_1+\Delta t_1}
+\end{equation}
+This corresponds to a "rising average" over the first epoch, and standard average between them, and a falling average over the second epoch (hence the "hat average"). Evidently, the hat average between the two epochs is the operation needed to relate the tendency $\partial\xi/\partial t$ to the difference between the values of $\xi$ averaged over the two epochs.
+
+Note that the diagnostics output from MOM5 to form the hat averaging correspond to standard, rising and falling averages over a shorter, pre-defined time period (below daily) that does not usually correspond to the epoch differences of interest (e.g. differences between months). If our longer epoch of interest, say $t\in(t_1,t_1+\Delta t_1)$, consists of $N$ sections of shorter diagnostics of length $\Delta t$ (e.g. the month of January consists of $N=31$ sections of length $\Delta t=1$ day, with $\Delta t_1=N\Delta t$), then we can use the following formula's to compute the rising "difference" (i.e. the first term in the previous equation) over the longer (i.e. entire January) period from the rising averages over each day,
+\begin{equation}
+\int_{t_1}^{t_1+N\Delta t} \frac{t-t_1}{N\Delta t} \frac{\partial\xi}{\partial t}dt = \sum_{n=1}^N \frac{1}{N} \int_{t_1+(n-1)\Delta t}^{t_1+n\Delta t} \frac{t-(t_1+(n-1)\Delta t)}{\Delta t} \frac{\partial\xi}{\partial t} dt + \sum_{n=1}^N \frac{(n-1)}{N} \int_{t_1+(n-1)\Delta t}^{t_1+n\Delta t} \frac{\partial\xi}{\partial t} dt
+\end{equation}
+where the LHS represents the long rising difference over the period $t\in(t_1,t_1+\Delta t_1)$, the first term on the RHS is the sum of $1/N$ times the short rising difference over the short period plus $(n-1)/N$ times the short standard difference over the short period.
+The long standard difference is trivially,
+\begin{equation}
+\int_{t_1}^{t_1+N\Delta t} \frac{\partial\xi}{\partial t}dt = \sum_{n=1}^N \int_{t_1+(n-1)\Delta t}^{t_1+n\Delta t} \frac{\partial\xi}{\partial t} dt
+\end{equation}
+the long falling difference can be computed as the difference between the two previous equations
+\begin{equation}
+\int_{t_1}^{t_1+N\Delta t} \frac{t_1 + N\Delta t - t}{N\Delta t} \frac{\partial\xi}{\partial t}dt = \int_{t_1}^{t_1+N\Delta t} \frac{\partial\xi}{\partial t}dt - \int_{t_1}^{t_1+N\Delta t} \frac{t-t_1}{N\Delta t} \frac{\partial\xi}{\partial t}dt
+\end{equation}
 

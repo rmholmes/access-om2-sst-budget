@@ -16,8 +16,8 @@ for output in outputs:
     arguments = {'XXOUTPUTXX':str(output),
                     }
 
-    fscr = 'daily_online_mlt_budget_year_' + str(output) + '.sub'
-    os.system('cp ../daily_online_mlt_budget_year.sub ' + fscr)
+    fscr = 'process_online_budget_year_' + str(output) + '.sub'
+    os.system('cp ../process_online_budget_year.sub ' + fscr)
     with fileinput.FileInput(fscr, inplace=True) as file:
         for line in file:
             line_out = line
