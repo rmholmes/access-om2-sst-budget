@@ -5,7 +5,7 @@ import os
 import fileinput
 import time as time_sleeper
 
-outputs = np.arange(336,371) # 336 = 1989, 365=2018
+outputs = np.arange(336,371)
 sleep_time = 0
 dry = False
 
@@ -15,10 +15,8 @@ for output in outputs:
     arguments = {'XXOUTPUTXX':str(output),
                     }
 
-    fscr = 'process_online_budget_year_' + str(output) + '.sub'
-    #os.system('cp ../process_online_budget_year.sub ' + fscr)
-    os.system('cp ../process_online_budget_year_salinity.sub ' + fscr)
-    #os.system('cp ../process_online_hatavg_budget_year.sub ' + fscr)
+    fscr = 'process_offline_monthly_budget_year_' + str(output) + '.sub'
+    os.system('cp ../process_offline_monthly_budget_year.sub ' + fscr)
     with fileinput.FileInput(fscr, inplace=True) as file:
         for line in file:
             line_out = line

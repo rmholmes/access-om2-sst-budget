@@ -1,0 +1,264 @@
+#!/bin/bash
+#PBS -N DMLTXXMONTHXX
+#PBS -P m35
+#PBS -l ncpus=14
+#PBS -l mem=64GB
+#PBS -l walltime=00:30:00
+#PBS -l jobfs=10GB
+#PBS -l wd
+#PBS -l storage=gdata/xp65+gdata/e14+scratch/e14
+#PBS -q normal
+
+module purge
+module use /g/data/xp65/public/modules
+module load conda/analysis3-25.06
+
+# XOUTPUTX -> output to process
+# XMONTHX -> month to process
+
+python3 -c "$(cat << EOF
+
+import xarray as xr
+import numpy as np
+import os
+from tqdm import tqdm
+from dask.distributed import Client
+
+client = Client(n_workers=14)
+
+# Settings and paths:
+output = XXOUTPUTXX
+month = XXMONTHXX
+
+base = '/scratch/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/'
+tmp_folder = base + 'post_processed_diags/'
+
+base2 = base + 'output%03d/ocean/' % output
+reg = [None,None,None,None] # Globe
+times = '2019-%02d' % (month)
+
+chunks2D = {'time':1,'yt_ocean':216,'xt_ocean':240}
+chunks3D = {'time':1,'st_ocean':25,'yt_ocean':324,'xt_ocean':360}
+
+ds_grid = xr.open_dataset(base2 + 'ocean_grid.nc',chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))#.isel(time=times)
+rho0 = 1035.
+Cp = 3992.10322329649
+
+# Standard daily diagnostics:
+ds_day = xr.open_dataset(base2 + 'ocean_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+ds_day = ds_day.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day.time.values]})
+ds_day.average_DT.data = ds_day.average_DT*np.timedelta64(1,'D')
+ds_day = ds_day.sel(time=times)
+
+# 3D budget data:
+ds_day_budget_3d = xr.open_dataset(base2 + 'ocean_budget_daily_3d.nc',decode_times=False,chunks=chunks3D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+
+# Fix time variable by decoding time by hand (see https://forum.access-hive.org.au/t/cftime-vs-datetime64-time-encoding-issues-with-access-om2-025-omip-2-run/4085);
+ds_day_budget_3d = ds_day_budget_3d.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_budget_3d.time.values]})
+
+# Fix average_DT by decoding by hand:
+ds_day_budget_3d.average_DT.data = ds_day_budget_3d.average_DT*np.timedelta64(1,'D')
+
+# Subselect time period:
+ds_day_budget_3d = ds_day_budget_3d.sel(time=times)
+
+# Define functions:
+def mixed_layer_bin_offline(ds_budget,ds_budget_2d,mld,dzt):
+    """
+    Bin raw ("Eulerian") 3D (and 2D-surface layer only) time-averaged budget terms into the time-averaged mixed layer
+
+    Inputs:
+    ds_budget -> dataset containing time-averaged 3D budget quantities
+    ds_budget_2d -> dataset containing time-averaged 2D (surface layer only) budget quantities
+    mld -> dataarray containing time-averaged mixed layer depth
+    dzt -> datarray containing time-averaged grid cell thicknesses
+
+    Outputs:
+    ds_budget_in_mld -> dataset containing budget terms binned into the mixed layer, in units of degC/second
+    """
+
+    # Sum over mixed layer:
+    ds_budget_in_mld = ds_budget.isel(st_ocean=0,drop=True).copy(deep=True)
+    for var in list(ds_budget_2d.data_vars):
+        ds_budget_in_mld[var] = xr.zeros_like(ds_budget['fixedh_tendency']).isel(st_ocean=0,drop=True).copy(deep=True)
+    for ti in range(len(ds_budget.time)): # Loop over time
+        dzt_ti = dzt.isel(time=ti).load()       
+        dzt_ti_bot = dzt_ti.cumsum('st_ocean')  # Depth (from free surface) of bottom of each cell
+        ds_budget_ti = ds_budget.isel(time=ti).load()
+        mld_ti = mld.isel(time=ti).load()
+        for var in list(ds_budget.data_vars):
+            ds_budget_in_mld[var][ti,:,:] = ds_budget_ti[var].where(dzt_ti_bot<mld_ti).sum('st_ocean')   # Include all of cells that lie completely in the mixed layer
+            for k in range(len(ds_budget_ti.st_ocean)-1):
+                ds_budget_in_mld[var][ti,:,:] += xr.where(np.logical_and(dzt_ti_bot[k,:,:]>mld_ti,dzt_ti_bot[k+1,:,:]<mld_ti),((mld_ti-dzt_ti_bot[k,:,:])/dzt_ti[k,:,:])*ds_budget_ti[var][k,:,:],0.) # Include only a fraction of cells that lie partially within the mixed layer
+            ds_budget_in_mld[var][ti,:,:] = ds_budget_in_mld[var][ti,:,:]/rho0/Cp/mld_ti # Convert units from Wm-2 to degC/sec
+
+        # Add 2D surface layer variables:
+        surf_frac = xr.where(dzt_ti_bot[0,:,:]>mld_ti,mld_ti/dzt_ti[0,:,:],1.)            # In regions where the mixed layer depth is shallower than the thickness of the surface grid cell, take only that fraction from the 2D variables
+        for var in list(ds_budget_2d.data_vars):
+            ds_budget_in_mld[var][ti,:,:] = (surf_frac*ds_budget_2d[var][ti,:,:]/rho0/Cp/mld_ti).load()
+
+    # Compute residual for check:
+    ds_budget_in_mld['residual'] = ds_budget_in_mld['fixedh_tendency'] - ds_budget_in_mld[list(ds_budget_in_mld.data_vars)[1:]].to_array().sum('variable')
+        
+    return(ds_budget_in_mld)
+
+def compute_tendency_entrainment(mlt_budget,mlt_snap):
+    """
+    Compute tendency term from snapshots and entrainment by residual.
+    """
+
+    mlt_snap = mlt_snap.transpose(*mlt_budget['fixedh_tendency'].dims)
+
+    # Compute mlt tendency by taking time derivative of snapshot mlt:
+    mlt_budget['mlt_tendency'] = xr.zeros_like(mlt_budget.fixedh_tendency).copy(deep=True)
+    mlt_budget['mlt_tendency'].data = mlt_snap.isel(time=slice(1,None)).values - mlt_snap.isel(time=slice(0,-1)).values
+    # mlt_budget['mlt_tendency'] = mlt_budget['mlt_tendency']/(ds_day_budget.average_DT/np.timedelta64(1,'s')) # Note: Depending on time decoding this line may change
+    DT = xr.zeros_like(mlt_budget['mlt_tendency'].time)
+    DT.data = (mlt_snap.time.isel(time=slice(1,None)).values-mlt_snap.time.isel(time=slice(0,-1)).values)/np.timedelta64(1,'s')
+    mlt_budget['mlt_tendency'] = mlt_budget['mlt_tendency']/DT
+
+    # Compute entrainment by residual:
+    mlt_budget['entrainment'] = -(mlt_budget['fixedh_tendency'] - mlt_budget['mlt_tendency'])
+
+    return(mlt_budget)
+
+def compute_corrections(mlt_budget,ds_std,D,save_cor=False,use_temp_at_mlb=False):
+    """
+    Compute corrections to advection, surface mass flux and total tendency terms in offline budgets.
+
+    Inputs (all time averages):
+    - mlt_budget               - grouped budget in units degC/sec
+    - ds_std['pme_river']      - surface mass flux (kg m-2 s-1)
+    - ds_std['temp_in_mld']    - mixed layer temperature (kg m-3 deg C)
+    - ds_std['eta_t_tendency'] - deta/dt (kg m-2 s-1)
+    - ds_std['eta_t']          - free surface height (m)
+    - D                        - ocean depth (m)
+    - ds_std['mld']            - mixed layer depth 
+    - ds_std['dzt']            - layer thicknesses (for computing fraction of surface layer)
+    - ds_std['temp']           - 3D temperature (for computing temperature at base of mixed layer)
+    - save_cor                 - whether to save the correction terms individually for testing
+    
+    """
+
+    # Extract variables and do some unit conversions:
+    mlt = ds_std.temp_in_mld.load()/rho0  # DegC
+    pme = ds_std.pme_river.load()/rho0    # ms-1
+    eta = ds_std.eta_t.load()             # m
+    detadt = ds_std.eta_t_tendency.load() # ms-1
+    eta_smooth = ds_std.eta_smoother.load() # ms-1
+    H = ds_std.mld.load()                         # m
+    dzs = ds_std.dzt.isel(st_ocean=0).load()      # m
+    if use_temp_at_mlb:      # Use online computed temp_at_mlb
+        tmlb = ds_std.temp_at_mlb.load()
+    else:      # Compute temp_at_mlb from time-averaged 3D temperature and mld
+        t3d = ds_std.temp.load()              # 3D temperature for tmlb
+        if t3d.max() > 100.: t3d -= 273.15    # Convert to celsius if needed
+    
+        # Compute entrained tracer for adv_cor2 (note, since H is a thickness of water, we can interpolate using st_ocean, not the time and space dependent z):
+        tmlb = compute_tmlb(t3d,H)
+    
+    # In regions where the mixed layer depth is shallower than the thickness of the surface grid cell, 
+    # take only that fraction from the 2D variables (which all these corrections are):
+    surf_frac = xr.where(dzs>H,H/dzs,1.)
+    
+    # Compute corrections: 
+    pme_cor = -pme*mlt/H*surf_frac                             # ms-1 degC / m = degC s-1
+    eta_smoother_cor = -eta_smooth*mlt/H*surf_frac
+    adv_cor1 = (-detadt + pme + eta_smooth)*mlt/H*surf_frac
+    adv_cor2 = detadt*tmlb*(1-H/(D+eta))/H*surf_frac
+    if save_cor:
+        mlt_budget['pme_cor'] = pme_cor
+        mlt_budget['eta_smoother_cor'] = eta_smoother_cor
+        mlt_budget['adv_cor1'] = adv_cor1
+        mlt_budget['adv_cor2'] = adv_cor2
+        
+    # Apply corrections:
+    mlt_budget['advection'] += adv_cor1 + adv_cor2
+    mlt_budget['surface_flux'] += pme_cor + eta_smoother_cor
+    mlt_budget['fixedh_tendency'] += adv_cor1 + adv_cor2 + pme_cor + eta_smoother_cor
+    
+    return(mlt_budget)
+
+def compute_tmlb(t3d,H):
+    """
+    Linearly interpolate t3d to H (I don't understand why xarray's interp finds this so hard!)
+    """
+    
+    tmlb = np.nan*xr.zeros_like(t3d.isel(st_ocean=0)).values
+    
+    tmlb = xr.where(H<t3d.st_ocean[0],t3d.isel(st_ocean=0).values,np.nan)
+    tmlb = xr.where(H>t3d.st_ocean[-1],t3d.isel(st_ocean=-1).values,tmlb)
+    
+    for s in range(len(t3d.st_ocean)-1):
+        z = t3d.st_ocean[s]
+        zp1 = t3d.st_ocean[s+1]
+        between_pts = np.logical_and(z < H,zp1 > H)
+        tz = t3d.isel(st_ocean=s)
+        tzp1 = t3d.isel(st_ocean=s+1)
+        tmlb = xr.where(between_pts,tzp1*(H - z)/(zp1 - z) + tz*(zp1 - H)/(zp1 - z),tmlb)
+    return(tmlb)
+
+def compute_offline_budget_ti(ds_budget_3d,ds_std,ht,use_temp_at_mlb=False):
+    """
+    Compute offline budget for a single time slice
+    """
+
+    # Group terms and load data (we do this before doing the binning to save unneccessary compute):
+    ds_budget_3d_reduced = ds_budget_3d['temp_tendency'].load().rename('fixedh_tendency').to_dataset()
+    for var in bud_var_grps.keys():
+        ds_budget_3d_reduced[var] = ds_budget_3d[bud_var_grps[var][0]].load()
+        if (len(bud_var_grps[var])>1):
+            for raw_var in bud_var_grps[var][1:]:
+                ds_budget_3d_reduced[var] += ds_budget_3d[raw_var].load()
+    
+    ds_budget_3d_reduced_2d = ds_budget_3d[bud_2d_vars].load()
+    
+    # Do binning into mixed layer:
+    bud = mixed_layer_bin_offline(ds_budget_3d_reduced,ds_budget_3d_reduced_2d,ds_std.mld.load(),ds_std.dzt.load())
+    # Add 2D vars to sbc term:
+    for var in bud_2d_vars:
+        bud['surface_flux'] += bud[var]
+        bud = bud.drop_vars([var])
+    
+    # Compute offline correction terms and apply them:
+    bud = compute_corrections(bud,ds_std,ht,save_cor=False,use_temp_at_mlb=use_temp_at_mlb)
+
+    # Compute tendency and entrainment (not really correct for offline, so we don't do it):
+    #bud = compute_tendency_entrainment(bud,ds_snapshot.temp_in_mld/rho0)
+    
+    return(bud)
+
+# Offline budget terms grouping:
+bud_var_grps = {'advection':['temp_advection','temp_submeso','temp_vdiffuse_k33','neutral_diffusion_temp','neutral_gm_temp'],
+                'vert_mixing':['temp_vdiffuse_diff_cbt','temp_nonlocal_KPP'],
+                'surface_flux':['temp_vdiffuse_sbc','frazil_3d','temp_rivermix'],
+                'sw_pen':['sw_heat']}
+bud_2d_vars = ['temp_eta_smooth','sfc_hflux_pme']
+
+# ht for zstar calc:
+ht = ds_grid.ht.load()
+
+# Add some vars to standard outputs from budget output:
+ds_day['dzt'] = ds_day_budget_3d.dzt
+ds_day['eta_t_tendency'] = ds_day_budget_3d.eta_t_tendency
+ds_day['eta_smoother'] = ds_day_budget_3d.eta_smoother
+
+mlt_budget_stavg_daily_offline_uncat = []
+
+# Loop over day:
+for ti in tqdm(range(len(ds_day_budget_3d.time))):
+
+    bud = compute_offline_budget_ti(ds_day_budget_3d.isel(time=slice(ti,ti+1)),
+                                    ds_day.isel(time=slice(ti,ti+1)),
+                                    ht,use_temp_at_mlb=True)
+    
+    mlt_budget_stavg_daily_offline_uncat.append(bud)
+
+mlt_budget_stavg_daily_offline = xr.concat(mlt_budget_stavg_daily_offline_uncat,dim='time')
+
+# Save to file:
+fname = tmp_folder + 'mlt_budget_stavg_daily_offline_output%03d_month%02d.nc' % (output,month)
+mlt_budget_stavg_daily_offline.to_netcdf(fname)
+
+EOF
+)"

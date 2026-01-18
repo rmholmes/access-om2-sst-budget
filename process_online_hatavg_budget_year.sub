@@ -42,26 +42,17 @@ ds_grid = xr.open_dataset(base2 + 'ocean_grid.nc',chunks=chunks2D).sel(xt_ocean=
 rho0 = 1035.
 Cp = 3992.10322329649
 
-# Standard average daily budget diagnostics:
-ds_day_budget = xr.open_dataset(base2 + 'ocean_budget_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
-
-# Snapshots for standard average tendency computation:
-ds_day_snapshot = xr.open_dataset(base2 + 'ocean_snapshot_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
-# Add previous output for last element:
-ds_day_snapshot_m1 = xr.open_dataset(base2.replace(str(output),str(output-1)) + 'ocean_snapshot_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
-ds_day_snapshot = xr.concat([ds_day_snapshot_m1.isel(time=-1),ds_day_snapshot],dim='time')
+# Load falling average daily budget diagnostics (note that the "_risavg" is a misnomer - they are falling averages):
+ds_day_budget = xr.open_dataset(base2 + 'ocean_budget_daily_risavg.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
 
 # Fix time variable by decoding time by hand (see https://forum.access-hive.org.au/t/cftime-vs-datetime64-time-encoding-issues-with-access-om2-025-omip-2-run/4085);
 ds_day_budget = ds_day_budget.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_budget.time.values]})
-ds_day_snapshot = ds_day_snapshot.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_snapshot.time.values]})
 
 # Fix average_DT by decoding by hand:
 ds_day_budget.average_DT.data = ds_day_budget.average_DT*np.timedelta64(1,'D')
 
 # Subselect time period:
 ds_day_budget = ds_day_budget.sel(time=times)
-ds_day_snapshot = ds_day_snapshot.sel(time=times_snap)
-
 
 bud_tendency = 'temp_tendency_in_mld_cor'
 bud_var_grps = {'advection':['temp_advection_in_mld_cor',
@@ -104,13 +95,18 @@ def compute_corrections(ds_day_budget):
 
 def mlt_budget_fixedh(ds_day_budget, do_extras = True):
 
+    # Divisor to apply to all terms.
+    # Note that the division by average_DT in seconds fixes a bug in the 
+    # normalization of the daily falling average diagnostics
+    divisor = rho0*Cp*ds_day_budget.average_DT/np.timedelta64(1,'s')
+
     # Extract variable sums in groups, dividing by rho0*Cp to convert to degC/second
-    mlt_budget = (ds_day_budget[bud_tendency]/rho0/Cp).rename('fixedh_tendency').to_dataset()
+    mlt_budget = (ds_day_budget[bud_tendency]/divisor).rename('fixedh_tendency').to_dataset()
     for var in bud_var_grps.keys():
-        mlt_budget[var] = ds_day_budget[bud_var_grps[var][0]]/rho0/Cp
+        mlt_budget[var] = ds_day_budget[bud_var_grps[var][0]]/divisor
         if (len(bud_var_grps[var])>1):
             for raw_var in bud_var_grps[var][1:]:
-                mlt_budget[var] += ds_day_budget[raw_var]/rho0/Cp
+                mlt_budget[var] += ds_day_budget[raw_var]/divisor
     
     # Compute residual for check:
     mlt_budget['residual'] = mlt_budget['fixedh_tendency'].copy(deep=True)
@@ -119,26 +115,10 @@ def mlt_budget_fixedh(ds_day_budget, do_extras = True):
 
     if do_extras:
         for var in bud_var_extras.keys():
-            mlt_budget[var] = ds_day_budget[bud_var_extras[var][0]]/rho0/Cp
+            mlt_budget[var] = ds_day_budget[bud_var_extras[var][0]]/divisor
             if (len(bud_var_extras[var])>1):
                 for raw_var in bud_var_extras[var][1:]:
-                    mlt_budget[var] += ds_day_budget[raw_var]/rho0/Cp
-
-    return(mlt_budget)
-
-def compute_tendency_entrainment(mlt_budget,mlt_snap):
-
-    mlt_snap = mlt_snap.transpose(*mlt_budget['fixedh_tendency'].dims)
-
-    # Compute mlt tendency by taking time derivative of snapshot mlt:
-    mlt_budget['mlt_tendency'] = xr.zeros_like(mlt_budget.fixedh_tendency).copy(deep=True)
-    mlt_budget['mlt_tendency'].data = mlt_snap.isel(time=slice(1,None)).values - mlt_snap.isel(time=slice(0,-1)).values
-    DT = xr.zeros_like(mlt_budget['mlt_tendency'].time)
-    DT.data = (mlt_snap.time.isel(time=slice(1,None)).values-mlt_snap.time.isel(time=slice(0,-1)).values)/np.timedelta64(1,'s')
-    mlt_budget['mlt_tendency'] = mlt_budget['mlt_tendency']/DT
-
-    # Compute entrainment by residual:
-    mlt_budget['entrainment'] = -(mlt_budget['fixedh_tendency'] - mlt_budget['mlt_tendency'])
+                    mlt_budget[var] += ds_day_budget[raw_var]/divisor
 
     return(mlt_budget)
 
@@ -151,16 +131,15 @@ bs = 30; tl = len(ds_day_budget.time)
 blocks = [range(tl)[x*bs:(x+1)*bs] for x in range(int(np.ceil(tl/bs)))]
 blocks_snap = [range(tl+1)[x*bs:(x+1)*bs + 1] for x in range(int(np.ceil(tl/bs)))]
 
-mlt_budget_stavg_daily_uncat = []
+mlt_budget_falavg_daily_uncat = []
 for i in tqdm(range(len(blocks))):
     bud = mlt_budget_fixedh(ds_day_budget.isel(time=blocks[i]))
-    bud = compute_tendency_entrainment(bud,ds_day_snapshot.temp_in_mld.isel(time=blocks_snap[i])/rho0)
-    mlt_budget_stavg_daily_uncat.append(bud.load())
-mlt_budget_stavg_daily = xr.concat(mlt_budget_stavg_daily_uncat,dim='time')
+    mlt_budget_falavg_daily_uncat.append(bud.load())
+mlt_budget_falavg_daily = xr.concat(mlt_budget_falavg_daily_uncat,dim='time')
 
 # Save to file if desired:
-fname = tmp_folder + 'mlt_budget_stavg_daily_online_output%03d.nc' % output
-mlt_budget_stavg_daily.to_netcdf(fname)
+fname = tmp_folder + 'mlt_budget_falavg_daily_online_output%03d.nc' % output
+mlt_budget_falavg_daily.to_netcdf(fname)
 
 # Create monthly means from daily files and save back to file:
 ds  = xr.open_dataset(fname, chunks={'time':61, 'yt_ocean': 180, 'xt_ocean': 240})

@@ -1,0 +1,183 @@
+#!/bin/bash
+#PBS -N DmlsXXOUTPUTXX
+#PBS -P dx2
+#PBS -l ncpus=28
+#PBS -l mem=126GB
+#PBS -l walltime=01:00:00
+#PBS -l jobfs=10GB
+#PBS -l wd
+#PBS -l storage=gdata/xp65+gdata/e14+scratch/e14
+#PBS -q normal
+
+module purge
+module use /g/data/xp65/public/modules
+module load conda/analysis3-25.06
+
+# XOUTPUTX -> output to process
+
+python3 -c "$(cat << EOF
+
+import xarray as xr
+import numpy as np
+import os
+from tqdm import tqdm
+from dask.distributed import Client
+
+client = Client(n_workers=28)
+
+# Settings and paths:
+output = XXOUTPUTXX
+
+base = '/scratch/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/'
+tmp_folder = base + 'post_processed_diags/'
+
+base2 = base + 'output%03d/ocean/' % output
+reg = [None,None,None,None] # Globe
+times = slice(None,None)
+times_snap = slice(None,None) # Note; this must be 1 more than times.
+
+chunks2D = {'time':1,'yt_ocean':216,'xt_ocean':240}
+
+ds_grid = xr.open_dataset(base2 + 'ocean_grid.nc',chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))#.isel(time=times)
+rho0 = 1035.
+Cp = 3992.10322329649
+
+# Standard average daily budget diagnostics:
+ds_day_budget = xr.open_dataset(base2 + 'ocean_budget_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+
+# Snapshots for standard average tendency computation:
+ds_day_snapshot = xr.open_dataset(base2 + 'ocean_snapshot_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+# Add previous output for last element:
+ds_day_snapshot_m1 = xr.open_dataset(base2.replace(str(output),str(output-1)) + 'ocean_snapshot_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+ds_day_snapshot = xr.concat([ds_day_snapshot_m1.isel(time=-1),ds_day_snapshot],dim='time')
+
+# Fix time variable by decoding time by hand (see https://forum.access-hive.org.au/t/cftime-vs-datetime64-time-encoding-issues-with-access-om2-025-omip-2-run/4085);
+ds_day_budget = ds_day_budget.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_budget.time.values]})
+ds_day_snapshot = ds_day_snapshot.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_day_snapshot.time.values]})
+
+# Fix average_DT by decoding by hand:
+ds_day_budget.average_DT.data = ds_day_budget.average_DT*np.timedelta64(1,'D')
+
+# Subselect time period:
+ds_day_budget = ds_day_budget.sel(time=times)
+ds_day_snapshot = ds_day_snapshot.sel(time=times_snap)
+
+
+bud_tendency = 'salt_tendency_in_mld_cor'
+bud_var_grps = {'advection':['salt_advection_in_mld_cor',
+                             'salt_submeso_in_mld',
+                             'neutral_diffusion_in_mld_salt',
+                             'neutral_gm_in_mld_salt',
+                             'salt_vdiffuse_k33_in_mld'],
+                'vert_mixing':['salt_nonlocal_KPP_in_mld',
+                               'salt_vdiffuse_diff_cbt_in_mld'],
+                'surface_flux':['salt_rivermix_in_mld',
+                                'salt_vdiffuse_sbc_in_mld',       # This is the restoring term - if wanting to separate it out.
+                                'pme_in_mld_cor',                 # This is the surface freshwater flux term - the main one. It enters as a "correction" term in the language of the mls budget described in the theory above and in the paper.
+                                'salt_eta_smooth_in_mld_cor']}
+bud_var_extras = {}
+
+def compute_corrections(ds_day_budget):
+    """
+    Compute corrections to advection and surface mass flux terms in ds_day_budget for salinity
+    """
+
+    # P-E+R correction:
+    # pme_river_times_salt_in_mld = psu kg m -3 s-1
+    pme_cor = -ds_day_budget['pme_river_times_salt_in_mld']/1000.
+    ds_day_budget['pme_in_mld_cor'] = pme_cor
+
+    # Eta-smoother correction:
+    eta_smoother_cor = -ds_day_budget['eta_smoother_times_salt_in_mld']/1000.
+    ds_day_budget['salt_eta_smooth_in_mld_cor'] = ds_day_budget['salt_eta_smooth_in_mld'] + eta_smoother_cor
+
+    # Advection correction:
+    adv_cor1 = -(ds_day_budget['eta_t_tendency_times_salt_in_mld']-ds_day_budget['pme_river_times_salt_in_mld'] - ds_day_budget['eta_smoother_times_salt_in_mld'])/1000.
+    adv_cor2 = ds_day_budget['s_surf_ent_salt']/1000.
+    ds_day_budget['salt_advection_in_mld_cor'] = ds_day_budget['salt_advection_in_mld'] + adv_cor1 + adv_cor2
+
+    # Total correction for residual:
+    ds_day_budget['salt_tendency_in_mld_cor'] = ds_day_budget['salt_tendency_in_mld']  + pme_cor + adv_cor1 + adv_cor2 + eta_smoother_cor
+
+    return(ds_day_budget)
+
+def mls_budget_fixedh(ds_day_budget, do_extras = True):
+    """
+    Compute fixedh budget terms, including residual. Does not include entrainment or mls tendency.
+    if do_extras=True, also add extra budget terms (e.g. the components of the surface flux) from bud_var_extras.
+    """
+    # Extract variable sums in groups, dividing by rho0 and multiplying by 1000 to convert to psu/second
+    mls_budget = (ds_day_budget[bud_tendency]/rho0*1000.).rename('fixedh_tendency').to_dataset()
+    for var in bud_var_grps.keys():
+        mls_budget[var] = ds_day_budget[bud_var_grps[var][0]]/rho0*1000.
+        if (len(bud_var_grps[var])>1):
+            for raw_var in bud_var_grps[var][1:]:
+                mls_budget[var] += ds_day_budget[raw_var]/rho0*1000.
+    
+    # Compute residual for check:
+    mls_budget['residual'] = mls_budget['fixedh_tendency'].copy(deep=True)
+    for var in list(mls_budget.data_vars):
+        mls_budget['residual'] -= mls_budget[var]
+
+    if do_extras:
+        for var in bud_var_extras.keys():
+            mls_budget[var] = ds_day_budget[bud_var_extras[var][0]]/rho0*1000.
+            if (len(bud_var_extras[var])>1):
+                for raw_var in bud_var_extras[var][1:]:
+                    mls_budget[var] += ds_day_budget[raw_var]/rho0*1000.
+
+    return(mls_budget)
+
+def compute_tendency_entrainment(mls_budget,mls_snap):
+    """
+    Compute tendency term from snapshots and entrainment by residual.
+    """
+
+    mls_snap = mls_snap.transpose(*mls_budget['fixedh_tendency'].dims)
+
+    # Compute mls tendency by taking time derivative of snapshot mls:
+    mls_budget['mls_tendency'] = xr.zeros_like(mls_budget.fixedh_tendency).copy(deep=True)
+    mls_budget['mls_tendency'].data = mls_snap.isel(time=slice(1,None)).values - mls_snap.isel(time=slice(0,-1)).values
+    DT = xr.zeros_like(mls_budget['mls_tendency'].time)
+    DT.data = (mls_snap.time.isel(time=slice(1,None)).values-mls_snap.time.isel(time=slice(0,-1)).values)/np.timedelta64(1,'s')
+    mls_budget['mls_tendency'] = mls_budget['mls_tendency']/DT
+
+    # Compute entrainment by residual:
+    mls_budget['entrainment'] = -(mls_budget['fixedh_tendency'] - mls_budget['mls_tendency'])
+
+    return(mls_budget)
+
+ds_day_budget = compute_corrections(ds_day_budget)
+
+# Compute in blocks (e.g. if doing a whole year):
+
+# NOTE: THIS still seems way slower than it should be... Something simple might make it faster...
+bs = 30; tl = len(ds_day_budget.time)
+blocks = [range(tl)[x*bs:(x+1)*bs] for x in range(int(np.ceil(tl/bs)))]
+blocks_snap = [range(tl+1)[x*bs:(x+1)*bs + 1] for x in range(int(np.ceil(tl/bs)))]
+
+mls_budget_stavg_daily_uncat = []
+for i in tqdm(range(len(blocks))):
+    bud = mls_budget_fixedh(ds_day_budget.isel(time=blocks[i]))
+    bud = compute_tendency_entrainment(bud,ds_day_snapshot.salt_in_mld.isel(time=blocks_snap[i])/rho0)
+    mls_budget_stavg_daily_uncat.append(bud.load())
+mls_budget_stavg_daily = xr.concat(mls_budget_stavg_daily_uncat,dim='time')
+
+# Save to file if desired:
+fname = tmp_folder + 'mls_budget_stavg_daily_online_output%03d.nc' % output
+mls_budget_stavg_daily.to_netcdf(fname)
+
+# Create monthly means from daily files and save back to file:
+ds  = xr.open_dataset(fname, chunks={'time':61, 'yt_ocean': 180, 'xt_ocean': 240})
+ds_mon = xr.zeros_like(ds.resample(time='1ME').mean()).copy(deep=True)
+
+for var in tqdm(ds.data_vars):
+    ds_mon[var] = ds[var].resample(time='1ME').mean().load()
+ds_mon = ds_mon.assign_coords({'time':ds.time.resample(time='1ME').mean()})
+ds_mon.to_netcdf(fname[:-3] + '_monthly_mean.nc')
+
+# Remove daily file to save space:
+# os.remove(fname)
+
+EOF
+)"

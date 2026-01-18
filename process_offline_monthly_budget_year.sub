@@ -1,0 +1,212 @@
+#!/bin/bash
+#PBS -N DMLTXXOUTPUTXX
+#PBS -P m35
+#PBS -l ncpus=14
+#PBS -l mem=64GB
+#PBS -l walltime=00:30:00
+#PBS -l jobfs=10GB
+#PBS -l wd
+#PBS -l storage=gdata/xp65+gdata/e14+scratch/e14
+#PBS -q normal
+
+module purge
+module use /g/data/xp65/public/modules
+module load conda/analysis3-25.06
+
+# XOUTPUTX -> output to process
+
+python3 -c "$(cat << EOF
+
+import xarray as xr
+import numpy as np
+import os
+from tqdm import tqdm
+from dask.distributed import Client
+
+client = Client(n_workers=14)
+
+# Settings and paths:
+output = XXOUTPUTXX
+
+base = '/scratch/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/'
+tmp_folder = base + 'post_processed_diags/'
+
+base2 = base + 'output%03d/ocean/' % output
+reg = [None,None,None,None] # Globe
+times = slice(None,None)
+times_snap = slice(None,None) # Note; this must be 1 more than times.
+
+chunks2D = {'time':1,'yt_ocean':216,'xt_ocean':240}
+chunks3D = {'time':1,'st_ocean':25,'yt_ocean':324,'xt_ocean':360}
+
+ds_grid = xr.open_dataset(base2 + 'ocean_grid.nc',chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))#.isel(time=times)
+rho0 = 1035.
+Cp = 3992.10322329649
+
+# Standard monthly diagnostics:
+ds_mon = xr.open_dataset(base2 + 'ocean_month.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+ds_mon = ds_mon.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_mon.time.values]})
+ds_mon.average_DT.data = ds_mon.average_DT*np.timedelta64(1,'D')
+ds_mon = ds_mon.sel(time=times)
+
+# 3D budget data:
+ds_mon_budget_3d = xr.open_dataset(base2 + 'ocean_budget_month_3d.nc',decode_times=False,chunks=chunks3D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+
+# Monthly snapshots:
+ds_mon_snapshot = xr.open_dataset(base2 + 'ocean_snapshot_month.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+# Add previous output for last element:
+ds_mon_snapshot_m1 = xr.open_dataset(base2.replace(str(output),str(output-1)) + 'ocean_snapshot_month.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+ds_mon_snapshot = xr.concat([ds_mon_snapshot_m1.isel(time=-1),ds_mon_snapshot],dim='time')
+
+# Fix time variable by decoding time by hand (see https://forum.access-hive.org.au/t/cftime-vs-datetime64-time-encoding-issues-with-access-om2-025-omip-2-run/4085);
+ds_mon_budget_3d = ds_mon_budget_3d.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_mon_budget_3d.time.values]})
+ds_mon_snapshot = ds_mon_snapshot.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds_mon_snapshot.time.values]})
+
+# Fix average_DT by decoding by hand:
+ds_mon_budget_3d.average_DT.data = ds_mon_budget_3d.average_DT*np.timedelta64(1,'D')
+
+# Subselect time period:
+ds_mon_budget_3d = ds_mon_budget_3d.sel(time=times)
+ds_mon_snapshot = ds_mon_snapshot.sel(time=times_snap)
+
+# Define functions:
+def mixed_layer_bin_offline(ds_budget,ds_budget_2d,mld,dzt):
+
+    # Sum over mixed layer:
+    ds_budget_in_mld = ds_budget.isel(st_ocean=0,drop=True).copy(deep=True)
+    for var in list(ds_budget_2d.data_vars):
+        ds_budget_in_mld[var] = xr.zeros_like(ds_budget['fixedh_tendency']).isel(st_ocean=0,drop=True).copy(deep=True)
+    for ti in range(len(ds_budget.time)): # Loop over time
+        dzt_ti = dzt.isel(time=ti).load()       
+        dzt_ti_bot = dzt_ti.cumsum('st_ocean')  # Depth (from free surface) of bottom of each cell
+        ds_budget_ti = ds_budget.isel(time=ti).load()
+        mld_ti = mld.isel(time=ti).load()
+        for var in list(ds_budget.data_vars):
+            ds_budget_in_mld[var][ti,:,:] = ds_budget_ti[var].where(dzt_ti_bot<mld_ti).sum('st_ocean')   # Include all of cells that lie completely in the mixed layer
+            for k in range(len(ds_budget_ti.st_ocean)-1):
+                ds_budget_in_mld[var][ti,:,:] += xr.where(np.logical_and(dzt_ti_bot[k,:,:]>mld_ti,dzt_ti_bot[k+1,:,:]<mld_ti),((mld_ti-dzt_ti_bot[k,:,:])/dzt_ti[k,:,:])*ds_budget_ti[var][k,:,:],0.) # Include only a fraction of cells that lie partially within the mixed layer
+            ds_budget_in_mld[var][ti,:,:] = ds_budget_in_mld[var][ti,:,:]/rho0/Cp/mld_ti # Convert units from Wm-2 to degC/sec
+
+        # Add 2D surface layer variables:
+        surf_frac = xr.where(dzt_ti_bot[0,:,:]>mld_ti,mld_ti/dzt_ti[0,:,:],1.)            # In regions where the mixed layer depth is shallower than the thickness of the surface grid cell, take only that fraction from the 2D variables
+        for var in list(ds_budget_2d.data_vars):
+            ds_budget_in_mld[var][ti,:,:] = (surf_frac*ds_budget_2d[var][ti,:,:]/rho0/Cp/mld_ti).load()
+
+    # Compute residual for check:
+    ds_budget_in_mld['residual'] = ds_budget_in_mld['fixedh_tendency'] - ds_budget_in_mld[list(ds_budget_in_mld.data_vars)[1:]].to_array().sum('variable')
+        
+    return(ds_budget_in_mld)
+
+def compute_corrections(mlt_budget,ds_std,D,save_cor=False):
+
+    # Extract variables and do some unit conversions:
+    mlt = ds_std.temp_in_mld.load()/rho0  # DegC
+    pme = ds_std.pme_river.load()/rho0    # ms-1
+    eta = ds_std.eta_t.load()             # m
+    detadt = ds_std.eta_t_tendency.load() # ms-1
+    eta_smooth = ds_std.eta_smoother.load() # ms-1
+    H = ds_std.mld.load()                         # m
+    dzs = ds_std.dzt.isel(st_ocean=0).load()      # m
+    t3d = ds_std.temp.load()              # 3D temperature for tmlb
+    if t3d.max() > 100.: t3d -= 273.15    # Convert to celsius if needed
+    
+    # Compute entrained tracer for adv_cor2 (note, since H is a thickness of water, we can interpolate using st_ocean, not the time and space dependent z):
+    tmlb = compute_tmlb(t3d,H)
+    
+    # In regions where the mixed layer depth is shallower than the thickness of the surface grid cell, 
+    # take only that fraction from the 2D variables (which all these corrections are):
+    surf_frac = xr.where(dzs>H,H/dzs,1.)
+    
+    # Compute corrections: 
+    pme_cor = -pme*mlt/H*surf_frac                             # ms-1 degC / m = degC s-1
+    eta_smoother_cor = -eta_smooth*mlt/H*surf_frac
+    adv_cor1 = (-detadt + pme + eta_smooth)*mlt/H*surf_frac
+    adv_cor2 = detadt*tmlb*(1-H/(D+eta))/H*surf_frac
+    if save_cor:
+        mlt_budget['pme_cor'] = pme_cor
+        mlt_budget['eta_smoother_cor'] = eta_smoother_cor
+        mlt_budget['adv_cor1'] = adv_cor1
+        mlt_budget['adv_cor2'] = adv_cor2
+        
+    # Apply corrections:
+    mlt_budget['advection'] += adv_cor1 + adv_cor2
+    mlt_budget['surface_flux'] += pme_cor + eta_smoother_cor
+    mlt_budget['fixedh_tendency'] += adv_cor1 + adv_cor2 + pme_cor + eta_smoother_cor
+    
+    return(mlt_budget)
+
+def compute_tmlb(t3d,H):
+    
+    tmlb = np.nan*xr.zeros_like(t3d.isel(st_ocean=0)).values
+    
+    tmlb = xr.where(H<t3d.st_ocean[0],t3d.isel(st_ocean=0).values,np.nan)
+    tmlb = xr.where(H>t3d.st_ocean[-1],t3d.isel(st_ocean=-1).values,tmlb)
+    
+    for s in range(len(t3d.st_ocean)-1):
+        z = t3d.st_ocean[s]
+        zp1 = t3d.st_ocean[s+1]
+        between_pts = np.logical_and(z < H,zp1 > H)
+        tz = t3d.isel(st_ocean=s)
+        tzp1 = t3d.isel(st_ocean=s+1)
+        tmlb = xr.where(between_pts,tzp1*(H - z)/(zp1 - z) + tz*(zp1 - H)/(zp1 - z),tmlb)
+    return(tmlb)
+
+def compute_offline_budget_ti(ds_budget_3d,ds_std,ht):
+
+    # Group terms and load data (we do this before doing the binning to save unneccessary compute):
+    ds_budget_3d_reduced = ds_budget_3d['temp_tendency'].load().rename('fixedh_tendency').to_dataset()
+    for var in bud_var_grps.keys():
+        ds_budget_3d_reduced[var] = ds_budget_3d[bud_var_grps[var][0]].load()
+        if (len(bud_var_grps[var])>1):
+            for raw_var in bud_var_grps[var][1:]:
+                ds_budget_3d_reduced[var] += ds_budget_3d[raw_var].load()
+    
+    ds_budget_3d_reduced_2d = ds_budget_3d[bud_2d_vars].load()
+    
+    # Do binning into mixed layer:
+    bud = mixed_layer_bin_offline(ds_budget_3d_reduced,ds_budget_3d_reduced_2d,ds_std.mld.load(),ds_std.dzt.load())
+    # Add 2D vars to sbc term:
+    for var in bud_2d_vars:
+        bud['surface_flux'] += bud[var]
+        bud = bud.drop_vars([var])
+    
+    # Compute offline correction terms and apply them:
+    bud = compute_corrections(bud,ds_std,ht,save_cor=False)
+
+    # Compute tendency and entrainment (not really correct for offline, so we don't do it):
+    #bud = compute_tendency_entrainment(bud,ds_snapshot.temp_in_mld/rho0)
+    
+    return(bud)    
+
+# Offline budget terms grouping:
+bud_var_grps = {'advection':['temp_advection','temp_submeso','temp_vdiffuse_k33','neutral_diffusion_temp','neutral_gm_temp'],
+                'vert_mixing':['temp_vdiffuse_diff_cbt','temp_nonlocal_KPP'],
+                'surface_flux':['temp_vdiffuse_sbc','frazil_3d','temp_rivermix'],
+                'sw_pen':['sw_heat']}
+bud_2d_vars = ['temp_eta_smooth','sfc_hflux_pme']
+
+# Add sfc_hflux_pme into budget ds from standard monthly diagnostics file:
+ds_mon_budget_3d['sfc_hflux_pme'] = ds_mon['sfc_hflux_pme']
+
+# ht for zstar calc:
+ht = ds_grid.ht.load()
+
+mlt_budget_stavg_monthly_offline_uncat = []
+
+# Loop over month:
+for ti in tqdm(range(len(ds_mon_budget_3d.time))):
+
+    bud = compute_offline_budget_ti(ds_mon_budget_3d.isel(time=slice(ti,ti+1)),
+                                    ds_mon.isel(time=slice(ti,ti+1)),
+                                    ht)
+    
+    mlt_budget_stavg_monthly_offline_uncat.append(bud)
+
+mlt_budget_stavg_monthly_offline = xr.concat(mlt_budget_stavg_monthly_offline_uncat,dim='time')
+
+# Save to file:
+fname = tmp_folder + 'mlt_budget_stavg_monthly_offline_output%03d.nc' % output
+mlt_budget_stavg_monthly_offline.to_netcdf(fname)
+
+EOF
+)"
