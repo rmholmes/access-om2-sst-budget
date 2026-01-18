@@ -15,8 +15,9 @@ for output in outputs:
     arguments = {'XXOUTPUTXX':str(output),
                     }
 
-    fscr = 'process_online_budget_year_' + str(output) + '.sub'
+    #fscr = 'process_online_budget_year_' + str(output) + '.sub'
     #os.system('cp ../process_online_budget_year.sub ' + fscr)
+    fscr = 'process_online_budget_salinity_year_' + str(output) + '.sub'
     os.system('cp ../process_online_budget_year_salinity.sub ' + fscr)
     #os.system('cp ../process_online_hatavg_budget_year.sub ' + fscr)
     with fileinput.FileInput(fscr, inplace=True) as file:
