@@ -7,7 +7,7 @@ Holmes and Malan, Accurately diagnosing mixed layer tracer budgets in a global o
 ## Repository contents
 
 Jupyter notebooks:
-- `Theory_and_Diagnostics.ipynb` - this notebook contains a short overview of the theory and diagnostics. See the above paper for more details on the theory. This notebook contains no code (only used because github can't seem to display latex equations in the README.md).
+- `Theory_and_Diagnostics.ipynb` - this notebook contains a short overview of the theory and diagnostics. See the above paper for more details on the theory. This notebook contains no code (only used because github can't seem to display latex equations in the README.md). 
 - `Mixed_Layer_Temperature_Budget.ipynb` - contains code to load in pre-computed budget diagnostics and analyse an event/time period of interest (start here if you are new).
 - `Offline_Online_Budget_Comparison.ipynb` - contains code to compare online with offline methods.
 - `Testing_and_Checks.ipynb` - contains code to perform a range of checks used during development of the methods (e.g. budget closure checks, diagnostic checks etc.).
@@ -19,3 +19,7 @@ Other scripts:
 - `spawn_process_online_budget.py`, `process_online_budget_year.sub`, `process_online_budget_year_salinity.sub` and `process_online_hatavg_budget_year.sub` - scripts for computing the grouped mixed layer tracer budgets a year at a time using parallel PBS jobs on NCI. One for salinity and one for temperature (just modify which script is used in `spawn_process_online_budget.py` to choose which one), and one for hat-averaged temperature budgets.
 - `process_offline_daily_budget_month.sub` and `spawn_process_offline_daily_budget.py` - scripts for computing the grouped mixed layer temperature budget for daily *offline* data (requires daily resolution 3D heat budget outputs).
 - `process_offline_monthly_budget_month.sub` and `spawn_process_offline_monthly_budget.py` - scripts for computing the grouped mixed layer temperature budget for monthly *offline* data (requires monthly resolution 3D heat budget outputs).
+
+## Suggestions for new users
+
+Start by looking through the `Theory_and_Diagnostics.ipynb` notebook to get a feel for how things work. Then have a look at the `Mixed_Layer_Temperature_Budget.ipynb` and modify it for your event (spatial region and time period) of interest.
