@@ -2,7 +2,7 @@
 
 This repository contains methodology and analysis routines for accurately diagnosing mixed layer tracer budgets in the ACCESS-OM2 global numerical ocean model. The methods make use of new online diagnostics added to the MOM5 source code for this purpose, as described in the following paper,
 
-Holmes, Malan and Bladwell, Accurately diagnosing mixed layer tracer budgets in a global ocean model, in preparation.
+Holmes and Malan, Accurately diagnosing mixed layer tracer budgets in a global ocean model, in preparation.
 
 ## Repository contents
 
