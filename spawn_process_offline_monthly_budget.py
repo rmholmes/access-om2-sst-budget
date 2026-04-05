@@ -5,7 +5,7 @@ import os
 import fileinput
 import time as time_sleeper
 
-outputs = np.arange(336,371)
+outputs = np.arange(337,371)
 sleep_time = 0
 dry = False
 

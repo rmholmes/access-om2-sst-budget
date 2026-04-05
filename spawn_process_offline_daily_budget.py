@@ -6,7 +6,7 @@ import fileinput
 import time as time_sleeper
 
 outputs = [366]
-months = [3]#np.arange(1,13)
+months = np.arange(2,13)
 sleep_time = 0
 dry = False
 

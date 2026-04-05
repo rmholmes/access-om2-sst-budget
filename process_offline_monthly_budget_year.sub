@@ -6,7 +6,7 @@
 #PBS -l walltime=00:30:00
 #PBS -l jobfs=10GB
 #PBS -l wd
-#PBS -l storage=gdata/xp65+gdata/e14+scratch/e14
+#PBS -l storage=gdata/xp65+gdata/e14+scratch/e14+gdata/av17
 #PBS -q normal
 
 module purge
@@ -28,8 +28,8 @@ client = Client(n_workers=14)
 # Settings and paths:
 output = XXOUTPUTXX
 
-base = '/scratch/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/'
-tmp_folder = base + 'post_processed_diags/'
+base = '/g/data/av17/access-nri/OM2/025deg_jra55_iaf_cycle6_online_mlt/'
+tmp_folder = '/g/data/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/post_processed_diags/mlt_budget_offline/'
 
 base2 = base + 'output%03d/ocean/' % output
 reg = [None,None,None,None] # Globe
@@ -94,7 +94,25 @@ def mixed_layer_bin_offline(ds_budget,ds_budget_2d,mld,dzt):
 
     # Compute residual for check:
     ds_budget_in_mld['residual'] = ds_budget_in_mld['fixedh_tendency'] - ds_budget_in_mld[list(ds_budget_in_mld.data_vars)[1:]].to_array().sum('variable')
+
+    return(ds_budget_in_mld)
+
+def mixed_layer_bin_offline_extras(ds_budget_2d,mld,dzt):
+
+    # Sum over mixed layer:
+    ds_budget_in_mld = ds_budget_2d.copy(deep=True)
+    for var in list(ds_budget_2d.data_vars):
+        ds_budget_in_mld[var] = xr.zeros_like(ds_budget_2d[list(ds_budget_2d.data_vars)[0]]).copy(deep=True)
+    for ti in range(len(ds_budget_2d.time)): # Loop over time
+        dzt_ti = dzt.isel(time=ti).load()       
+        dzt_ti_bot = dzt_ti.cumsum('st_ocean')  # Depth (from free surface) of bottom of each cell
+        mld_ti = mld.isel(time=ti).load()
         
+        # Add 2D surface layer variables:
+        surf_frac = xr.where(dzt_ti_bot[0,:,:]>mld_ti,mld_ti/dzt_ti[0,:,:],1.)            # In regions where the mixed layer depth is shallower than the thickness of the surface grid cell, take only that fraction from the 2D variables
+        for var in list(ds_budget_2d.data_vars):
+            ds_budget_in_mld[var][ti,:,:] = (surf_frac*ds_budget_2d[var][ti,:,:]/rho0/Cp/mld_ti).load()
+
     return(ds_budget_in_mld)
 
 def compute_corrections(mlt_budget,ds_std,D,save_cor=False):
@@ -175,6 +193,17 @@ def compute_offline_budget_ti(ds_budget_3d,ds_std,ht):
 
     # Compute tendency and entrainment (not really correct for offline, so we don't do it):
     #bud = compute_tendency_entrainment(bud,ds_snapshot.temp_in_mld/rho0)
+
+    # Compute extras:
+    keys = list(bud_var_extras.keys())
+    ds_budget_2d_extras = ds_budget_3d[bud_var_extras[keys[0]][0]].load().rename(keys[0]).to_dataset()
+    for var in keys[1:]:
+        ds_budget_2d_extras[var] = ds_budget_3d[bud_var_extras[var][0]].load()
+        if (len(bud_var_extras[var])>1):
+            for raw_var in bud_var_extras[var][1:]:
+                ds_budget_3d_reduced[var] += ds_budget_3d[raw_var].load()
+    bud_extras = mixed_layer_bin_offline_extras(ds_budget_2d_extras,ds_std.mld.load(),ds_std.dzt.load())
+    bud = xr.merge([bud,bud_extras])
     
     return(bud)    
 
@@ -184,9 +213,17 @@ bud_var_grps = {'advection':['temp_advection','temp_submeso','temp_vdiffuse_k33'
                 'surface_flux':['temp_vdiffuse_sbc','frazil_3d','temp_rivermix'],
                 'sw_pen':['sw_heat']}
 bud_2d_vars = ['temp_eta_smooth','sfc_hflux_pme']
+bud_var_extras = {'shortwave':['swflx'],
+                  'longwave':['lw_heat'],
+                  'sensible':['sens_heat'],
+                  'latent':['evap_heat']}
 
-# Add sfc_hflux_pme into budget ds from standard monthly diagnostics file:
+# Add terms from standard monthly diagnostics file into budget ds:
 ds_mon_budget_3d['sfc_hflux_pme'] = ds_mon['sfc_hflux_pme']
+ds_mon_budget_3d['swflx'] = ds_mon['swflx']
+ds_mon_budget_3d['lw_heat'] = ds_mon['lw_heat']
+ds_mon_budget_3d['sens_heat'] = ds_mon['sens_heat']
+ds_mon_budget_3d['evap_heat'] = ds_mon['evap_heat']
 
 # ht for zstar calc:
 ht = ds_grid.ht.load()
