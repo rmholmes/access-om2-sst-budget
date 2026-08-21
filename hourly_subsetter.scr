@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Spatial subset parameters
+X_MIN=285
+X_MAX=350
+Y_MIN=340
+Y_MAX=440
+
+cd /g/data/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/output366_7day_hourly/ocean/
+
+OUTPUT_DIR="subsetted"
+
+for f in *.nc; do
+    echo "Processing $f..."
+    ncks -d xt_ocean,${X_MIN},${X_MAX} -d yt_ocean,${Y_MIN},${Y_MAX} "$f" "${OUTPUT_DIR}/${f}"
+done
+
+echo "Done."
