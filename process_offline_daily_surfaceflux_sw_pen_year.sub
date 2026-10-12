@@ -1,0 +1,145 @@
+#!/bin/bash
+#PBS -N DSWFXXOUTPUTXX
+#PBS -P m35
+#PBS -l ncpus=14
+#PBS -l mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -l jobfs=10GB
+#PBS -l wd
+#PBS -l storage=gdata/xp65+gdata/e14+scratch/e14+gdata/av17
+#PBS -q normal
+
+module purge
+module use /g/data/xp65/public/modules
+module load conda/analysis3-25.06
+
+# XOUTPUTX -> output (year) to process
+
+# This script computes an *approximate* offline daily mixed layer surface flux budget, split into:
+# - surface_flux: the non-penetrative part of the surface heat flux (swflx + lw_heat + sens_heat + evap_heat),
+#                 binned into the daily-average mixed layer. This is purely a 2D (surface layer) quantity.
+# - sw_pen:       the shortwave heat absorbed below the surface, reconstructed from the daily swflx using a
+#                 monthly climatological vertical absorption fraction g = sw_heat/swflx (see below), and then
+#                 binned into the daily-average mixed layer.
+#
+# Unlike process_offline_daily_budget_month.sub, this does not attempt to close the full mixed layer
+# temperature budget (no advection, vertical mixing or correction terms) - only these two surface-flux-derived
+# terms are computed - so a full year can be processed in one go.
+
+python3 -c "$(cat << EOF
+
+import xarray as xr
+import numpy as np
+import os
+from dask.distributed import Client
+
+client = Client(n_workers=14)
+
+# Settings and paths:
+output = XXOUTPUTXX # Year to process (e.g. 366 = 2019)
+
+base = '/g/data/av17/access-nri/OM2/025deg_jra55_iaf_cycle6_online_mlt/'
+tmp_folder = '/g/data/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/post_processed_diags/mlt_budget_offline/'
+
+base2 = base + 'output%03d/ocean/' % output
+reg = [None,None,None,None] # Globe
+times = '%d' % (1989 + output - 336) # Calendar year corresponding to this output (output 366 = 2019)
+
+chunks2D = {'time':1,'yt_ocean':216,'xt_ocean':240}
+chunks3D = {'time':1,'st_ocean':25,'yt_ocean':324,'xt_ocean':360}
+
+rho0 = 1035.
+Cp = 3992.10322329649
+
+# Climatology period used for the sw penetration fraction (1989-2018, as used elsewhere in this repo):
+clim_outputs = list(range(336,366))
+clim_str = 'output%03d-%03d' % (clim_outputs[0], clim_outputs[-1])
+clim_fname = tmp_folder + 'sw_pen_fraction_climatology_' + clim_str + '.nc'
+
+def decode_time(ds):
+    ds = ds.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds.time.values]})
+    return(ds)
+
+# Compute (and cache) the monthly climatological shortwave absorption fraction g(month,st_ocean,y,x) = sw_heat/swflx:
+if os.path.exists(clim_fname):
+
+    g_clim = xr.open_dataset(clim_fname, chunks=chunks3D)
+
+else:
+
+    sw_heat_paths = [base + 'output%03d/ocean/ocean_budget_month_3d.nc' % o for o in clim_outputs]
+    swflx_paths = [base + 'output%03d/ocean/ocean_month.nc' % o for o in clim_outputs]
+
+    ds_sw_heat_clim = xr.open_mfdataset(sw_heat_paths, decode_times=False, combine='nested', concat_dim='time',
+                                        chunks=chunks3D, data_vars='minimal', coords='minimal', compat='override')[['sw_heat']]
+    ds_swflx_clim = xr.open_mfdataset(swflx_paths, decode_times=False, combine='nested', concat_dim='time',
+                                      chunks=chunks2D, data_vars='minimal', coords='minimal', compat='override')[['swflx']]
+
+    ds_sw_heat_clim = decode_time(ds_sw_heat_clim)
+    ds_swflx_clim = decode_time(ds_swflx_clim)
+
+    # Monthly climatology (average over the 30 climatology years, by calendar month):
+    sw_heat_clim = ds_sw_heat_clim.groupby('time.month').mean('time').sw_heat.load()
+    swflx_clim = ds_swflx_clim.groupby('time.month').mean('time').swflx.load()
+
+    # Avoid dividing by (near) zero swflx (e.g. polar night):
+    g_clim = xr.where(np.abs(swflx_clim)>1.e-10, sw_heat_clim/swflx_clim, 0.).rename('g').to_dataset()
+    g_clim.to_netcdf(clim_fname)
+
+# Standard daily diagnostics (2D only - swflx, lw_heat, sens_heat, evap_heat and mld):
+ds_day = xr.open_dataset(base2 + 'ocean_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+ds_day = decode_time(ds_day)
+ds_day.average_DT.data = ds_day.average_DT*np.timedelta64(1,'D')
+ds_day = ds_day.sel(time=times)
+
+# Daily layer thicknesses (the only 3D field needed, for binning into the mixed layer):
+ds_day_budget_3d = xr.open_dataset(base2 + 'ocean_budget_daily_3d.nc',decode_times=False,chunks=chunks3D)[['dzt']].sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+ds_day_budget_3d = decode_time(ds_day_budget_3d)
+ds_day_budget_3d = ds_day_budget_3d.sel(time=times)
+
+g_clim = g_clim.sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+
+def bin_surface_2d_in_mld(da_2d,mld,dzt0):
+    """
+    Bin a purely surface-layer (non-penetrative) 2D flux into the (daily-average) mixed layer.
+    """
+    surf_frac = xr.where(dzt0>mld, mld/dzt0, 1.)
+    return(surf_frac*da_2d/rho0/Cp/mld)
+
+def bin_3d_in_mld(da_3d,mld,dzt):
+    """
+    Bin a 3D (depth-penetrating) flux into the (daily-average) mixed layer.
+    """
+    dzt_bot = dzt.cumsum('st_ocean')   # Depth of bottom of each cell
+    dzt_top = dzt_bot - dzt            # Depth of top of each cell
+
+    full_mask = dzt_bot<mld            # Cells lying entirely within the mixed layer
+    frac_mask = np.logical_and(dzt_top<mld, dzt_bot>=mld) # Cell straddling the base of the mixed layer
+    frac = (mld-dzt_top)/dzt
+
+    da_full = da_3d.where(full_mask).sum('st_ocean')
+    da_frac = (da_3d*frac).where(frac_mask).sum('st_ocean')
+
+    return((da_full.fillna(0.)+da_frac.fillna(0.))/rho0/Cp/mld)
+
+# Reconstruct the daily 3D shortwave heating using the monthly climatological absorption fraction:
+sw_heat_recon = g_clim.g.sel(month=ds_day.time.dt.month)*ds_day.swflx
+
+# Total non-penetrative surface heat flux:
+surface_flux_2d = ds_day.swflx + ds_day.lw_heat + ds_day.sens_heat + ds_day.evap_heat
+
+mld = ds_day.mld.load()
+dzt = ds_day_budget_3d.dzt.load()
+dzt0 = dzt.isel(st_ocean=0,drop=True)
+
+mlt_budget_surfaceflux = xr.Dataset({
+    'surface_flux': bin_surface_2d_in_mld(surface_flux_2d, mld, dzt0),
+    'sw_pen': bin_3d_in_mld(sw_heat_recon, mld, dzt),
+}).load()
+
+# Save to file:
+fname = tmp_folder + 'mlt_budget_stavg_daily_offline_surfaceflux_output%03d.nc' % output
+mlt_budget_surfaceflux.to_netcdf(fname)
+
+EOF
+)"
