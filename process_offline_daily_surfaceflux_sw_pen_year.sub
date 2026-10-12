@@ -19,8 +19,8 @@ module load conda/analysis3-25.06
 # - surface_flux: the non-penetrative part of the surface heat flux (swflx + lw_heat + sens_heat + evap_heat),
 #                 binned into the daily-average mixed layer. This is purely a 2D (surface layer) quantity.
 # - sw_pen:       the shortwave heat absorbed below the surface, reconstructed from the daily swflx using a
-#                 monthly climatological vertical absorption fraction g = sw_heat/swflx (see below), and then
-#                 binned into the daily-average mixed layer.
+#                 monthly vertical absorption fraction g = sw_heat/swflx (see below, computed from this same
+#                 output year's own monthly diagnostics), and then binned into the daily-average mixed layer.
 #
 # Unlike process_offline_daily_budget_month.sub, this does not attempt to close the full mixed layer
 # temperature budget (no advection, vertical mixing or correction terms) - only these two surface-flux-derived
@@ -31,6 +31,7 @@ python3 -c "$(cat << EOF
 import xarray as xr
 import numpy as np
 import os
+from tqdm import tqdm
 from dask.distributed import Client
 
 client = Client(n_workers=14)
@@ -51,40 +52,32 @@ chunks3D = {'time':1,'st_ocean':25,'yt_ocean':324,'xt_ocean':360}
 rho0 = 1035.
 Cp = 3992.10322329649
 
-# Climatology period used for the sw penetration fraction (1989-2018, as used elsewhere in this repo):
-clim_outputs = list(range(336,366))
-clim_str = 'output%03d-%03d' % (clim_outputs[0], clim_outputs[-1])
-clim_fname = tmp_folder + 'sw_pen_fraction_climatology_' + clim_str + '.nc'
+max_depth = 300. # Only need levels down to this nominal depth - shortwave absorption below this is negligible
 
 def decode_time(ds):
     ds = ds.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds.time.values]})
     return(ds)
 
-# Compute (and cache) the monthly climatological shortwave absorption fraction g(month,st_ocean,y,x) = sw_heat/swflx:
-if os.path.exists(clim_fname):
+# Determine the nominal level index closest to max_depth from this output's vertical grid:
+ds_day_budget_3d_full = xr.open_dataset(base2 + 'ocean_budget_daily_3d.nc',decode_times=False,chunks=chunks3D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+k_max = int(np.abs(ds_day_budget_3d_full.st_edges_ocean.values[1:] - max_depth).argmin())
 
-    g_clim = xr.open_dataset(clim_fname, chunks=chunks3D)
+# Compute the monthly shortwave absorption fraction g(month,st_ocean,y,x) = sw_heat/swflx from this output's
+# own monthly diagnostics. This fraction is set by the model's (fixed) optical attenuation scheme and the
+# seasonal solar cycle, not by year-to-year weather, so there's no need for a multi-year climatology here -
+# the only year-to-year variation is the small effect of sea level (zstar) on cell depths.
+ds_sw_heat_mon = xr.open_dataset(base2 + 'ocean_budget_month_3d.nc',decode_times=False,chunks=chunks3D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))[['sw_heat']].isel(st_ocean=slice(0,k_max+1))
+ds_swflx_mon = xr.open_dataset(base2 + 'ocean_month.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))[['swflx']]
 
-else:
+ds_sw_heat_mon = decode_time(ds_sw_heat_mon).sel(time=times)
+ds_swflx_mon = decode_time(ds_swflx_mon).sel(time=times)
 
-    sw_heat_paths = [base + 'output%03d/ocean/ocean_budget_month_3d.nc' % o for o in clim_outputs]
-    swflx_paths = [base + 'output%03d/ocean/ocean_month.nc' % o for o in clim_outputs]
+sw_heat_mon = ds_sw_heat_mon.sw_heat.load()
+swflx_mon = ds_swflx_mon.swflx.load()
 
-    ds_sw_heat_clim = xr.open_mfdataset(sw_heat_paths, decode_times=False, combine='nested', concat_dim='time',
-                                        chunks=chunks3D, data_vars='minimal', coords='minimal', compat='override')[['sw_heat']]
-    ds_swflx_clim = xr.open_mfdataset(swflx_paths, decode_times=False, combine='nested', concat_dim='time',
-                                      chunks=chunks2D, data_vars='minimal', coords='minimal', compat='override')[['swflx']]
-
-    ds_sw_heat_clim = decode_time(ds_sw_heat_clim)
-    ds_swflx_clim = decode_time(ds_swflx_clim)
-
-    # Monthly climatology (average over the 30 climatology years, by calendar month):
-    sw_heat_clim = ds_sw_heat_clim.groupby('time.month').mean('time').sw_heat.load()
-    swflx_clim = ds_swflx_clim.groupby('time.month').mean('time').swflx.load()
-
-    # Avoid dividing by (near) zero swflx (e.g. polar night):
-    g_clim = xr.where(np.abs(swflx_clim)>1.e-10, sw_heat_clim/swflx_clim, 0.).rename('g').to_dataset()
-    g_clim.to_netcdf(clim_fname)
+# Avoid dividing by (near) zero swflx (e.g. polar night):
+g = xr.where(np.abs(swflx_mon)>1.e-10, sw_heat_mon/swflx_mon, 0.)
+g_frac = g.assign_coords(month=('time',g.time.dt.month.values)).swap_dims({'time':'month'}).drop_vars('time').rename('g').to_dataset()
 
 # Standard daily diagnostics (2D only - swflx, lw_heat, sens_heat, evap_heat and mld):
 ds_day = xr.open_dataset(base2 + 'ocean_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
@@ -92,12 +85,14 @@ ds_day = decode_time(ds_day)
 ds_day.average_DT.data = ds_day.average_DT*np.timedelta64(1,'D')
 ds_day = ds_day.sel(time=times)
 
-# Daily layer thicknesses (the only 3D field needed, for binning into the mixed layer):
-ds_day_budget_3d = xr.open_dataset(base2 + 'ocean_budget_daily_3d.nc',decode_times=False,chunks=chunks3D)[['dzt']].sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+# Daily layer thicknesses (the only 3D field needed, for binning into the mixed layer). Only ever open/load
+# down to k_max - loading the full year's dzt at all ~50 levels is what caused a previous run to run out
+# of memory:
+ds_day_budget_3d = ds_day_budget_3d_full[['dzt']].isel(st_ocean=slice(0,k_max+1))
 ds_day_budget_3d = decode_time(ds_day_budget_3d)
 ds_day_budget_3d = ds_day_budget_3d.sel(time=times)
 
-g_clim = g_clim.sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+g_frac = g_frac.sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
 
 def bin_surface_2d_in_mld(da_2d,mld,dzt0):
     """
@@ -122,20 +117,28 @@ def bin_3d_in_mld(da_3d,mld,dzt):
 
     return((da_full.fillna(0.)+da_frac.fillna(0.))/rho0/Cp/mld)
 
-# Reconstruct the daily 3D shortwave heating using the monthly climatological absorption fraction:
-sw_heat_recon = g_clim.g.sel(month=ds_day.time.dt.month)*ds_day.swflx
+# Reconstruct the daily 3D shortwave heating using the monthly absorption fraction, and bin into the mixed
+# layer one calendar month at a time: selecting all 365 days against g_frac's 'month' dim in one go forces
+# dask to materialize the whole year as a single (huge) chunk, which is what blew out memory previously.
+mlt_budget_surfaceflux_uncat = []
+for month in tqdm(range(1,13)):
+    month_str = '%s-%02d' % (times,month)
 
-# Total non-penetrative surface heat flux:
-surface_flux_2d = ds_day.swflx + ds_day.lw_heat + ds_day.sens_heat + ds_day.evap_heat
+    ds_day_month = ds_day.sel(time=month_str)
+    dzt_month = ds_day_budget_3d.dzt.sel(time=month_str)
+    dzt0_month = dzt_month.isel(st_ocean=0,drop=True)
 
-mld = ds_day.mld.load()
-dzt = ds_day_budget_3d.dzt.load()
-dzt0 = dzt.isel(st_ocean=0,drop=True)
+    sw_heat_recon_month = g_frac.g.sel(month=month)*ds_day_month.swflx
+    surface_flux_2d_month = ds_day_month.swflx + ds_day_month.lw_heat + ds_day_month.sens_heat + ds_day_month.evap_heat
 
-mlt_budget_surfaceflux = xr.Dataset({
-    'surface_flux': bin_surface_2d_in_mld(surface_flux_2d, mld, dzt0),
-    'sw_pen': bin_3d_in_mld(sw_heat_recon, mld, dzt),
-}).load()
+    bud_month = xr.Dataset({
+        'surface_flux': bin_surface_2d_in_mld(surface_flux_2d_month, ds_day_month.mld, dzt0_month),
+        'sw_pen': bin_3d_in_mld(sw_heat_recon_month, ds_day_month.mld, dzt_month),
+    }).load()
+
+    mlt_budget_surfaceflux_uncat.append(bud_month)
+
+mlt_budget_surfaceflux = xr.concat(mlt_budget_surfaceflux_uncat, dim='time')
 
 # Save to file:
 fname = tmp_folder + 'mlt_budget_stavg_daily_offline_surfaceflux_output%03d.nc' % output

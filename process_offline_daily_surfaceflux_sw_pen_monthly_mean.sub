@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -N DSWFMMXXOUTPUTXX
+#PBS -P m35
+#PBS -l ncpus=4
+#PBS -l mem=32GB
+#PBS -l walltime=00:30:00
+#PBS -l jobfs=10GB
+#PBS -l wd
+#PBS -l storage=gdata/xp65+gdata/e14
+#PBS -q normal
+
+module purge
+module use /g/data/xp65/public/modules
+module load conda/analysis3-25.06
+
+# XOUTPUTX -> output (year) to process
+
+# Computes the monthly mean of mlt_budget_stavg_daily_offline_surfaceflux_output<output>.nc
+# (produced by process_offline_daily_surfaceflux_sw_pen_year.sub) and saves it alongside the daily file.
+
+python3 -c "$(cat << EOF
+
+import xarray as xr
+from tqdm import tqdm
+
+output = XXOUTPUTXX
+
+tmp_folder = '/g/data/e14/rmh561/access-om2/archive/025deg_jra55_iaf_cycle6_online_mlt/post_processed_diags/mlt_budget_offline/'
+fname = tmp_folder + 'mlt_budget_stavg_daily_offline_surfaceflux_output%03d.nc' % output
+
+ds = xr.open_dataset(fname, chunks={'time':61, 'yt_ocean': 180, 'xt_ocean': 240})
+ds_mon = xr.zeros_like(ds.resample(time='1ME').mean()).copy(deep=True)
+
+for var in tqdm(ds.data_vars):
+    ds_mon[var] = ds[var].resample(time='1ME').mean().load()
+ds_mon = ds_mon.assign_coords({'time':ds.time.resample(time='1ME').mean()})
+ds_mon.to_netcdf(fname[:-3] + '_monthly_mean.nc')
+
+EOF
+)"

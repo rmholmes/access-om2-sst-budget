@@ -83,17 +83,22 @@ ds_mon_snapshot = ds_mon_snapshot.sel(time=times_snap)
 # nominal *bottom edge* (st_edges_ocean[1:]) to target_depth, so the whole cell closest to 55m is included:
 k_target = int(np.abs(ds_mon.st_edges_ocean.values[1:] - target_depth).argmin())
 
-def compute_h_and_temp_in_depth(t3d,dzt,k):
+def compute_h_and_temp_in_depth(t3d_fixed,dzt_fixed):
     """
-    Thickness-weighted bottom depth and average temperature of the fixed layer made up of model levels 0:k+1
-    (inclusive), analogous to the online mld/temp_in_mld diagnostics but for a fixed (nominal) depth.
+    Thickness-weighted bottom depth and average temperature of the fixed layer, analogous to the online
+    mld/temp_in_mld diagnostics but for a fixed (nominal) depth. t3d_fixed/dzt_fixed must already be sliced
+    to just the levels making up that layer (0:k+1), so only those levels are ever loaded into memory.
     """
-    dzt_fixed = dzt.isel(st_ocean=slice(0,k+1))
+    dzt_fixed = dzt_fixed.load()
+    t3d_fixed = t3d_fixed.load()
     H = dzt_fixed.sum('st_ocean')
-    temp_in_H = (t3d.isel(st_ocean=slice(0,k+1))*dzt_fixed).sum('st_ocean')/H
+    temp_in_H = (t3d_fixed*dzt_fixed).sum('st_ocean')/H
     return(H,temp_in_H)
 
-H, temp_in_H = compute_h_and_temp_in_depth(ds_mon.temp.load(),ds_mon.dzt.load(),k_target)
+# Slice to the levels making up the fixed layer *before* loading - loading all ~50 levels for the whole
+# year/globe is what caused the previous run to run out of memory:
+H, temp_in_H = compute_h_and_temp_in_depth(ds_mon.temp.isel(st_ocean=slice(0,k_target+1)),
+                                           ds_mon.dzt.isel(st_ocean=slice(0,k_target+1)))
 ds_mon['mld'] = H
 ds_mon['temp_in_mld'] = temp_in_H
 
