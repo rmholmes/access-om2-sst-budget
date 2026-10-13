@@ -3,8 +3,9 @@
 import os
 import fileinput
 import time as time_sleeper
+import numpy as np
 
-outputs = [366]
+outputs = np.arange(336,371)# [366]
 sleep_time = 0
 dry = False
 

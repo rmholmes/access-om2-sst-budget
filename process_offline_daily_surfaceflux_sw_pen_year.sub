@@ -141,6 +141,10 @@ for month in tqdm(range(1,13)):
 
     bud_month = xr.Dataset({
         'surface_flux': bin_surface_2d_in_mld(surface_flux_2d_month, ds_day_month.mld, dzt0_month),
+        'shortwave': bin_surface_2d_in_mld(ds_day_month.swflx, ds_day_month.mld, dzt0_month),
+        'longwave': bin_surface_2d_in_mld(ds_day_month.lw_heat, ds_day_month.mld, dzt0_month),
+        'sensible': bin_surface_2d_in_mld(ds_day_month.sens_heat, ds_day_month.mld, dzt0_month),
+        'latent': bin_surface_2d_in_mld(ds_day_month.evap_heat, ds_day_month.mld, dzt0_month),
         'sw_pen': bin_3d_in_mld(sw_heat_recon_month, ds_day_month.mld, dzt_month),
     }).load()
 
