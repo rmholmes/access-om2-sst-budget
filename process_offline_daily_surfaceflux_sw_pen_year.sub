@@ -24,7 +24,10 @@ module load conda/analysis3-25.06
 #
 # Unlike process_offline_daily_budget_month.sub, this does not attempt to close the full mixed layer
 # temperature budget (no advection, vertical mixing or correction terms) - only these two surface-flux-derived
-# terms are computed - so a full year can be processed in one go.
+# terms are computed - so a full year can be processed in one go. It also uses the *monthly-mean* dzt (from
+# ocean_month.nc, available for every output) rather than daily dzt (only archived for output366), applying
+# it as a constant approximation across all days within that month - this is what lets this run for any
+# output, not just 366.
 
 python3 -c "$(cat << EOF
 
@@ -58,39 +61,40 @@ def decode_time(ds):
     ds = ds.assign_coords({'time':[np.datetime64('0001-01-01') + np.timedelta64(int(x*86400),'s') for x in ds.time.values]})
     return(ds)
 
-# Determine the nominal level index closest to max_depth from this output's vertical grid:
-ds_day_budget_3d_full = xr.open_dataset(base2 + 'ocean_budget_daily_3d.nc',decode_times=False,chunks=chunks3D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
-k_max = int(np.abs(ds_day_budget_3d_full.st_edges_ocean.values[1:] - max_depth).argmin())
+# Determine the nominal level index closest to max_depth from this output's vertical grid, and load the
+# monthly-mean dzt (available for every output, unlike the daily 3D budget file which only exists for 2019).
+# Keep this dask-backed (not .load()'d) - combining an eagerly-loaded numpy array with the still-chunked
+# daily fields below causes dask to duplicate it across every chunk of the other array, which is what blew
+# out memory previously:
+ds_mon_3d = xr.open_dataset(base2 + 'ocean_month.nc',decode_times=False,chunks=chunks3D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
+k_max = int(np.abs(ds_mon_3d.st_edges_ocean.values[1:] - max_depth).argmin())
+dzt_mon = ds_mon_3d.dzt.isel(st_ocean=slice(0,k_max+1))
+dzt_mon = decode_time(dzt_mon).sel(time=times)
 
 # Compute the monthly shortwave absorption fraction g(month,st_ocean,y,x) = sw_heat/swflx from this output's
 # own monthly diagnostics. This fraction is set by the model's (fixed) optical attenuation scheme and the
 # seasonal solar cycle, not by year-to-year weather, so there's no need for a multi-year climatology here -
 # the only year-to-year variation is the small effect of sea level (zstar) on cell depths.
 ds_sw_heat_mon = xr.open_dataset(base2 + 'ocean_budget_month_3d.nc',decode_times=False,chunks=chunks3D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))[['sw_heat']].isel(st_ocean=slice(0,k_max+1))
-ds_swflx_mon = xr.open_dataset(base2 + 'ocean_month.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))[['swflx']]
+ds_swflx_mon = ds_mon_3d[['swflx']]
 
 ds_sw_heat_mon = decode_time(ds_sw_heat_mon).sel(time=times)
 ds_swflx_mon = decode_time(ds_swflx_mon).sel(time=times)
 
-sw_heat_mon = ds_sw_heat_mon.sw_heat.load()
-swflx_mon = ds_swflx_mon.swflx.load()
+sw_heat_mon = ds_sw_heat_mon.sw_heat
+swflx_mon = ds_swflx_mon.swflx
 
-# Avoid dividing by (near) zero swflx (e.g. polar night):
-g = xr.where(np.abs(swflx_mon)>1.e-10, sw_heat_mon/swflx_mon, 0.)
-g_frac = g.assign_coords(month=('time',g.time.dt.month.values)).swap_dims({'time':'month'}).drop_vars('time').rename('g').to_dataset()
+# Avoid dividing by (near) zero swflx (e.g. polar night). Keep g indexed by its real (mid-month) timestamp,
+# rather than a 'month' dim, so it can be linearly interpolated onto each day below instead of being treated
+# as a step function that jumps at month boundaries. Rechunk 'time' to a single chunk (only 12 months, so
+# cheap) so .interp() below can work lazily rather than needing the whole thing eagerly loaded:
+g_frac = xr.where(np.abs(swflx_mon)>1.e-10, sw_heat_mon/swflx_mon, 0.).chunk({'time':-1}).rename('g').to_dataset()
 
 # Standard daily diagnostics (2D only - swflx, lw_heat, sens_heat, evap_heat and mld):
 ds_day = xr.open_dataset(base2 + 'ocean_daily.nc',decode_times=False,chunks=chunks2D).sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
 ds_day = decode_time(ds_day)
 ds_day.average_DT.data = ds_day.average_DT*np.timedelta64(1,'D')
 ds_day = ds_day.sel(time=times)
-
-# Daily layer thicknesses (the only 3D field needed, for binning into the mixed layer). Only ever open/load
-# down to k_max - loading the full year's dzt at all ~50 levels is what caused a previous run to run out
-# of memory:
-ds_day_budget_3d = ds_day_budget_3d_full[['dzt']].isel(st_ocean=slice(0,k_max+1))
-ds_day_budget_3d = decode_time(ds_day_budget_3d)
-ds_day_budget_3d = ds_day_budget_3d.sel(time=times)
 
 g_frac = g_frac.sel(xt_ocean=slice(reg[0],reg[1]),yt_ocean=slice(reg[2],reg[3]))
 
@@ -117,18 +121,22 @@ def bin_3d_in_mld(da_3d,mld,dzt):
 
     return((da_full.fillna(0.)+da_frac.fillna(0.))/rho0/Cp/mld)
 
-# Reconstruct the daily 3D shortwave heating using the monthly absorption fraction, and bin into the mixed
-# layer one calendar month at a time: selecting all 365 days against g_frac's 'month' dim in one go forces
-# dask to materialize the whole year as a single (huge) chunk, which is what blew out memory previously.
+# Reconstruct the daily 3D shortwave heating by linearly interpolating the monthly absorption fraction onto
+# each day (extrapolating for days before the first/after the last mid-month timestamp), and bin into the
+# mixed layer one calendar month at a time: doing the interpolation for all 365 days in one go forces dask to
+# materialize the whole year as a single (huge) chunk, which is what blew out memory previously.
 mlt_budget_surfaceflux_uncat = []
 for month in tqdm(range(1,13)):
     month_str = '%s-%02d' % (times,month)
 
     ds_day_month = ds_day.sel(time=month_str)
-    dzt_month = ds_day_budget_3d.dzt.sel(time=month_str)
+    # Approximation: use this calendar month's mean dzt for every day in the month, since daily dzt isn't
+    # archived outside output366:
+    dzt_month = dzt_mon.sel(time=month_str).isel(time=0,drop=True)
     dzt0_month = dzt_month.isel(st_ocean=0,drop=True)
 
-    sw_heat_recon_month = g_frac.g.sel(month=month)*ds_day_month.swflx
+    g_month = g_frac.g.interp(time=ds_day_month.time, kwargs={'fill_value':'extrapolate'})
+    sw_heat_recon_month = g_month*ds_day_month.swflx
     surface_flux_2d_month = ds_day_month.swflx + ds_day_month.lw_heat + ds_day_month.sens_heat + ds_day_month.evap_heat
 
     bud_month = xr.Dataset({
