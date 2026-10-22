@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N DMLTXXOUTPUTXX
-#PBS -P dx2
+#PBS -P m35
 #PBS -l ncpus=28
 #PBS -l mem=126GB
 #PBS -l walltime=01:00:00
@@ -81,7 +81,8 @@ bud_var_grps = {'advection':['temp_advection_in_mld_cor',
 bud_var_extras = {'shortwave':['swflx_in_mld'],
                   'longwave':['lw_heat_in_mld'],
                   'sensible':['sens_heat_in_mld'],
-                  'latent':['evap_heat_in_mld']}
+                  'latent':['evap_heat_in_mld'],
+                  'vert_convection':['temp_nonlocal_KPP_in_mld']}
 
 def compute_corrections(ds_day_budget):
 
