@@ -257,7 +257,8 @@ def compute_offline_budget_ti(ds_budget_3d,ds_std,ht):
 
 # Offline budget terms grouping:
 bud_var_grps = {'advection':['temp_advection','temp_submeso','temp_vdiffuse_k33','neutral_diffusion_temp','neutral_gm_temp'],
-                'vert_mixing':['temp_vdiffuse_diff_cbt','temp_nonlocal_KPP'],
+                'vert_diffusion':['temp_vdiffuse_diff_cbt'],
+                'vert_convection':['temp_nonlocal_KPP'],
                 'surface_flux':['temp_vdiffuse_sbc','frazil_3d','temp_rivermix'],
                 'sw_pen':['sw_heat']}
 bud_2d_vars = ['temp_eta_smooth','sfc_hflux_pme']
